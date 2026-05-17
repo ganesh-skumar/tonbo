@@ -771,6 +771,7 @@ where
             });
         }
 
+        // If L0 is full trigger compaction
         self.apply_l0_backpressure().await?;
 
         let commit_ts = self.next_commit_ts();

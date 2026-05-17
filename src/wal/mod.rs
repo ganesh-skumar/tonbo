@@ -505,6 +505,7 @@ where
     }
 }
 
+// WAL handler
 impl<E> WalHandle<E>
 where
     E: Executor + Timer + Clone,
@@ -537,18 +538,24 @@ where
         command: WalCommand,
         submission_seq: u64,
     ) -> WalResult<WalTicket<E>> {
+        // create channel for every batch
         let (ack_tx, ack_rx) = oneshot::channel();
         let enqueued_at = Instant::now();
 
+        //?
         self.inner.queue_depth.fetch_add(1, Ordering::SeqCst);
 
+        // wal message
         let msg = writer::WriterMsg::Enqueue {
             _submission_seq: submission_seq,
             command,
             enqueued_at,
-            ack_tx,
+            ack_tx, // sender for channel per record batch
         };
 
+        // sender that writes wal message, consumed by writer.rs.
+        // run_writer_loop, spawned by writer::spawn_writer and then
+        // writter write to storage
         let mut sender = self.inner.clone_sender();
         if let Err(_err) = sender.send(msg).await {
             self.inner.queue_depth.fetch_sub(1, Ordering::SeqCst);
@@ -647,6 +654,8 @@ where
     ) -> WalResult<WalTicket<E>> {
         let commit_values =
             Arc::new(UInt64Array::from(vec![commit_ts.get(); batch.num_rows()])) as ArrayRef;
+
+        // create wal row record
         let payload = DynBatchPayload::Row {
             batch: batch.clone(),
             commit_ts_column: Arc::clone(&commit_values),
