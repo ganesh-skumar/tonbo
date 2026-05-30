@@ -36,6 +36,602 @@ This current document remains intentionally narrower: it validates
 `read_after_compaction` first, then points to the next scenarios and
 instrumentation work needed to grow into that larger program.
 
+### Local vs Standard S3 Topology Follow-up
+
+As of March 30, 2026, this branch now has one valid first-pass comparison for
+`read_compaction_quiesced` between local storage and standard S3 from a
+non-EC2 host, plus one partially blocked higher-scale follow-up.
+
+Reference run note:
+
+- `benches/compaction/results/compaction_topology_2026-03-30.md`
+
+Reference artifacts:
+
+- valid local `scale=1`:
+  `target/tonbo-bench/compaction_local-1774884026526-2253191.json`
+- valid standard S3 `scale=1`:
+  `target/tonbo-bench/compaction_local-1774884042845-2253870.json`
+- invalid standard S3 `scale=4` after extended compaction wait:
+  `target/tonbo-bench/compaction_local-1774884882909-2283436.json`
+
+What changed before these runs:
+
+- the earlier object-store benchmark path used a probed S3 wrapper in the DB
+  read path,
+- that path produced invalid object-store artifacts during benchmark setup:
+  - `rows_per_scan = 0`
+  - `rows_processed = 0`
+  - `read_ops = 0`
+- a focused public-API S3 reopen-with-compaction test passed on the native
+  object-store path,
+- the benchmark was therefore switched back to the native object-store builder
+  path for correctness.
+
+Tradeoff of that benchmark fix:
+
+- local benchmark I/O counters remain valid,
+- object-store row visibility and latency are now valid again for the passing
+  cells,
+- object-store request counters (`read_ops`, `bytes_read`) should currently be
+  treated as unsupported until the probe wrapper is fixed.
+
+Valid `scale=1` comparison from this host:
+
+| Cell | Mean | p95 | Rows Processed | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `local, scale=1` | `41.19 ms` | `47.31 ms` | `16,384` | valid |
+| `standard S3, scale=1` | `1.678 s` | `1.726 s` | `16,384` | valid |
+
+Interpretation:
+
+- On this non-EC2 host, standard S3 is about `40x` slower than local on mean
+  latency for this small `read_compaction_quiesced` cell.
+- The standard-S3 cost is dominated by setup:
+  - mean prepare: about `1.652 s`
+  - mean consume: about `25.7 ms`
+  - mean snapshot stage alone: about `537 ms`
+- This means the branch is currently paying a large fixed object-store cost on
+  this topology before it starts streaming rows.
+
+Current block at `scale=4`:
+
+- local `scale=4` completed with valid rows,
+- standard S3 `scale=4` remained invalid even after increasing the compaction
+  wait timeout from `20 s` to `120 s`,
+- the run finished, but returned:
+  - `setup.rows_per_scan = 0`
+  - `summary.rows_processed = 0`
+
+Current conclusion from the non-EC2 first pass:
+
+- We had a real local-versus-standard-S3 comparison at `scale=1`.
+- We did not yet have a trustworthy standard-S3 `scale=4` comparison from that
+  host.
+- The next step was to move the comparison onto EC2 and retry there.
+
+### EC2 Same-Host Topology Follow-up
+
+As of March 31, 2026, this branch now has a valid same-host EC2 comparison for:
+
+- `read_compaction_quiesced` at `scale=1`
+- `read_compaction_quiesced` at `scale=4`
+- `swmr_gb_scale_mixed` at `~1 GB logical`
+
+Reference run note:
+
+- `benches/compaction/results/ec2_same_host_topology_2026-03-31.md`
+
+Reference artifacts:
+
+- directional local `scale=1`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774959138050-20408.json`
+- directional local `scale=4`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774959154810-20444.json`
+- directional standard S3 `scale=1`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774950219198-9849.json`
+- directional standard S3 `scale=4`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774954499953-19743.json`
+- SWMR local `1 GB`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774959331220-20736.json`
+- SWMR standard S3 `1 GB`:
+  `target/tonbo-bench/ec2-euc1/compaction_local-1774959375012-20910.json`
+
+Same-host EC2 directional comparison:
+
+| Cell | Mean | p95 | Rows Processed |
+| --- | ---: | ---: | ---: |
+| `ec2 local, scale=1` | `28.88 ms` | `29.30 ms` | `24,576` |
+| `ec2 standard S3, scale=1` | `747.19 ms` | `793.70 ms` | `24,576` |
+| `ec2 local, scale=4` | `81.18 ms` | `82.58 ms` | `24,576` |
+| `ec2 standard S3, scale=4` | `1263.28 ms` | `1284.84 ms` | `24,576` |
+
+Observed ratio on the same EC2 host:
+
+- `scale=1` mean: `25.9x`
+- `scale=1` p95: `27.1x`
+- `scale=4` mean: `15.6x`
+- `scale=4` p95: `15.6x`
+
+Interpretation:
+
+- same-region EC2 materially improves the standard-S3 numbers relative to the
+  non-EC2 remote host, but standard S3 is still an order of magnitude slower
+  than local on the same machine,
+- the standard-S3 cost remains heavily prepare/setup-dominated on this
+  scenario,
+- the earlier EC2 `scale=4` invalid artifact was a benchmark-harness bug, not
+  a proven generic engine reopen/read bug.
+
+Same-host EC2 SWMR `1 GB` comparison:
+
+| Cell | Mean Step (s) | p95 Step (s) | Throughput | Writer Mean (s) | Head Light (s) | Head Heavy (s) | Pinned Light (s) | Pinned Heavy (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ec2 local, ~1 GB logical` | `0.211` | `0.283` | `37.57 Krows/s` | `0.148` | `0.0076` | `0.0356` | `0.0028` | `0.0176` |
+| `ec2 standard S3, ~1 GB logical` | `9.642` | `11.950` | `823 rows/s` | `5.840` | `0.887` | `1.617` | `0.275` | `1.022` |
+
+Observed ratio on the same EC2 host:
+
+- whole mixed step mean: `45.7x`
+- writer mean: `39.5x`
+- `head_light`: `117.3x`
+- `head_heavy`: `45.4x`
+- `pinned_light`: `99.6x`
+- `pinned_heavy`: `58.1x`
+
+Interpretation:
+
+- the same-host `1 GB` result shows the branch deteriorates materially as state
+  size and workload realism increase,
+- the main wall is still the writer path on standard S3, but the reader costs
+  are also large enough to matter,
+- both same-host `1 GB` artifacts are correctness-valid, so these are usable
+  comparison numbers.
+
+### S3 Express Follow-up
+
+As of April 1, 2026, the branch no longer stops at S3 Express investigation.
+S3 Express now works end to end against a real directory bucket when Tonbo is
+linked to the local Fusio checkout with explicit Express support.
+
+Reference run note:
+
+- `benches/compaction/results/ec2_s3_express_cross_region_2026-04-01.md`
+
+Reference artifacts:
+
+- Express `scale=1`:
+  `/home/ubuntu/tonbo/target/tonbo-bench/compaction_local-1774974760820-43953.json`
+- Express `scale=4`:
+  `/home/ubuntu/tonbo/target/tonbo-bench/compaction_local-1774990219851-46818.json`
+- Express `1 GB` SWMR:
+  `/home/ubuntu/tonbo/target/tonbo-bench/compaction_local-1774991631101-47482.json`
+
+What changed to make Express work:
+
+- Fusio now has explicit `s3_express` handling for zonal virtual-hosted
+  endpoints plus `CreateSession` support.
+- Tonbo now exposes and wires `S3Spec.s3_express` through tests and benchmarks.
+- The benchmark harness now propagates `spec.s3_express` to the separate
+  object-store FS used for snapshot/cleanup metadata walking.
+
+That harness fix matters because the initial failing benchmark path was not the
+core DB path. It was the metadata walk rebuilding an S3 client without Express
+mode and then hitting the real Express endpoint with the wrong signing flow.
+
+Environment actually measured:
+
+- runner: EC2 `c7i.large` in `eu-central-1 / euc1-az1`
+- directory bucket: `us-east-1 / use1-az6`
+- endpoint kind: zonal virtual-hosted
+- network path: `public_internet_cross_region`
+
+Express directional comparison against the same EC2 host baselines:
+
+| Cell | Mean | p95 | Rows Processed |
+| --- | ---: | ---: | ---: |
+| `ec2 local, scale=1` | `28.88 ms` | `29.30 ms` | `24,576` |
+| `ec2 standard S3, scale=1` | `747.19 ms` | `793.70 ms` | `24,576` |
+| `ec2 S3 Express, scale=1` | `18.188 s` | `18.890 s` | `24,576` |
+| `ec2 local, scale=4` | `81.18 ms` | `82.58 ms` | `24,576` |
+| `ec2 standard S3, scale=4` | `1263.28 ms` | `1284.84 ms` | `24,576` |
+| `ec2 S3 Express, scale=4` | `9.356 s` | `9.651 s` | `24,576` |
+
+Express `1 GB` SWMR comparison against the same EC2 host baselines:
+
+| Cell | Mean Step (s) | p95 Step (s) | Throughput | Writer Mean (s) | Head Light (s) | Head Heavy (s) | Pinned Light (s) | Pinned Heavy (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ec2 local, ~1 GB logical` | `0.211` | `0.283` | `37.57 Krows/s` | `0.148` | `0.0076` | `0.0356` | `0.0028` | `0.0176` |
+| `ec2 standard S3, ~1 GB logical` | `9.642` | `11.950` | `823 rows/s` | `5.840` | `0.887` | `1.617` | `0.275` | `1.022` |
+| `ec2 S3 Express, ~1 GB logical` | `77.088` | `84.092` | `102.95 rows/s` | `42.486` | `9.523` | `13.860` | `2.978` | `8.241` |
+
+Interpretation:
+
+- These Express numbers prove functional enablement, not product advantage.
+- In this branch's only working topology, Express is much slower than the
+  same-host same-region standard-S3 cells:
+  - `scale=1` mean: `24.3x` slower than standard S3
+  - `scale=4` mean: `7.4x` slower than standard S3
+  - `1 GB` SWMR mixed-step mean: `8.0x` slower than standard S3
+- The directional Express cells are almost entirely prepare-dominated:
+  - `scale=1`: `99.5%` prepare
+  - `scale=4`: `98.8%` prepare
+- That strongly suggests the measured penalty is cross-region setup/request
+  establishment overhead, not the low-latency same-AZ story S3 Express is
+  designed for.
+
+Current conclusion:
+
+- The branch no longer has an S3 Express client-capability gap.
+- The remaining question is deployment topology.
+- The next meaningful Express comparison is:
+  - same-region EC2 runner
+  - ideally same-AZ runner
+  - standard-S3 control run from that same host
+
+### S3 Express Same-Region Same-Host Follow-up
+
+As of April 1, 2026, the branch also has the first directly comparable
+same-host runs between standard S3 and S3 Express in `us-east-1`.
+
+Reference run note:
+
+- `benches/compaction/results/ec2_use1_same_region_2026-04-01.md`
+
+Reference artifacts:
+
+- standard S3 `scale=1`:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775037685933-15549.json`
+- Express `scale=1`:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775037800005-15703.json`
+- standard S3 `scale=4`:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775038027706-15936.json`
+- Express `scale=4`:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775038376217-16364.json`
+- standard S3 `1 GB` SWMR:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775039166401-16780.json`
+- Express `1 GB` SWMR:
+  `/home/ubuntu/workspace/tonbo/target/tonbo-bench/compaction_local-1775040119330-17177.json`
+
+Environment actually measured:
+
+- runner: EC2 `c7i.large` in `us-east-1 / use1-az6`
+- standard S3 control bucket: `us-east-1`
+- Express directory bucket: `us-east-1 / use1-az6`
+- Express network placement: same region, same AZ
+
+Same-host directional comparison:
+
+| Cell | Mean | p95 | Rows Processed |
+| --- | ---: | ---: | ---: |
+| `use1 standard S3, scale=1` | `873.05 ms` | `1263.49 ms` | `24,576` |
+| `use1 S3 Express same-AZ, scale=1` | `2278.97 ms` | `2621.39 ms` | `24,576` |
+| `use1 standard S3, scale=4` | `2478.59 ms` | `2768.13 ms` | `24,576` |
+| `use1 S3 Express same-AZ, scale=4` | `4071.72 ms` | `4264.24 ms` | `24,576` |
+
+Same-host `1 GB` SWMR comparison:
+
+| Cell | Mean Step (s) | p95 Step (s) | Throughput | Writer Mean (s) | Head Light (s) | Head Heavy (s) | Pinned Light (s) | Pinned Heavy (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `use1 standard S3, ~1 GB logical` | `11.644` | `13.747` | `681.57 rows/s` | `7.571` | `1.034` | `1.690` | `0.289` | `1.060` |
+| `use1 S3 Express same-AZ, ~1 GB logical` | `40.162` | `42.338` | `197.60 rows/s` | `21.575` | `4.777` | `8.102` | `0.962` | `4.744` |
+
+What this changes relative to the earlier cross-region Express result:
+
+- the old absurd cross-region penalty was real and misleading
+- same-region same-AZ Express is much better than the earlier cross-region
+  Express runs
+- but it still does not beat the same-host standard-S3 control in the current
+  Tonbo/Fusio path
+
+Observed ratio on the same `us-east-1` host:
+
+- `scale=1` mean: Express `2.61x` slower than standard S3
+- `scale=4` mean: Express `1.64x` slower than standard S3
+- `1 GB` SWMR mixed-step mean: Express `3.45x` slower than standard S3
+
+Why this is still useful:
+
+- it proves the remaining gap is not just “wrong region”
+- it narrows the remaining problem to the current storage path itself
+
+Focused debug result:
+
+- a same-host Express debug rerun with `FUSIO_S3_EXPRESS_DEBUG=1` logged:
+  - `CreateSession` count: `1`
+  - Express list failures: `0`
+
+That matters because it means the old repeated-session bug is not the current
+dominant explanation for the same-host gap.
+
+Current interpretation:
+
+- the current Express path is still paying a larger fixed setup/write-path cost
+  than the standard-S3 path in Tonbo/Fusio
+- that gap grows especially large in write-heavy shapes:
+  - Express `1 GB` preload time: `2331.777 s`
+  - standard S3 `1 GB` preload time: `699.734 s`
+
+Current conclusion:
+
+- S3 Express is functionally working in the intended same-region same-AZ
+  topology
+- but the current implementation is not yet delivering a performance win
+- the next meaningful work is instrumentation and path-level cost accounting,
+  not more benchmark topologies
+
+### SWMR Pinned-Snapshot Follow-up
+
+As of March 27, 2026, the pinned-reader validity gap in the earlier local
+harness path had been explained and fixed.
+
+Root cause:
+
+- the first-pass harness did not hold a true pinned snapshot object,
+- instead it reconstructed pinned readers via
+  `snapshot_at(latest_manifest_version.timestamp)`,
+- after preload, the held read timestamp was `914` while the latest manifest
+  publish timestamp was only `14`,
+- that meant the reconstructed pinned path only saw the earliest manifest-backed
+  prefix of preload data,
+- the benchmark's heavy reader range starts at `warm-00000000`, and those warm
+  keys were not present at manifest timestamp `14`, so `pinned_heavy` returned
+  `0` rows for a harness reason, not a performance reason.
+
+The updated harness now:
+
+- holds a real snapshot object for pinned readers,
+- records both the held snapshot timestamp and the manifest-version timestamp in
+  the artifact,
+- records expected rows per reader class from the held pinned snapshot,
+- records the comparative row counts from manifest-version reconstruction so the
+  old mismatch is visible in machine-readable output,
+- fails the scenario if a reader expected to return rows instead returns `0`.
+
+Reference rerun note:
+
+- `benches/compaction/results/swmr_gb_scale_2026-03-27.md`
+
+Updated local `~1 GB` cell from artifact
+`target/tonbo-bench/compaction_local-1774592990634-1898420.json`:
+
+| Cell | Mean Step (ms) | p95 Step (ms) | Throughput | Writer Mean (ms) | Head Light (ms) | Head Heavy (ms) | Pinned Light (ms) | Pinned Heavy (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `local, ~1 GB logical` | `134.47` | `145.96` | `59.02 Krows/s` | `104.77` | `4.59` | `13.44` | `3.90` | `7.78` |
+
+Pinned-reader validity evidence now visible in the artifact:
+
+- held pinned snapshot mode: `held_snapshot`
+- held pinned snapshot timestamp: `914`
+- manifest-version timestamp previously used for reconstruction: `14`
+- held snapshot expected rows per scan:
+  - `pinned_light = 256`
+  - `pinned_heavy = 2048`
+- manifest-version reconstruction rows per scan:
+  - `pinned_light = 256`
+  - `pinned_heavy = 0`
+
+Current conclusion:
+
+- `pinned_heavy = 0` was a benchmark harness bug, not an engine bug proven by
+  this investigation.
+- The local pinned-reader path is now trustworthy enough for further local SWMR
+  work because it uses a true held snapshot and enforces non-empty invariants.
+- S3 / `10 GB` expansion should still wait until the same pinned-reader
+  semantics are exercised in those cells and we confirm the path remains stable
+  under their storage/topology costs.
+
+### SWMR Correctness-Gated Follow-up
+
+As of March 28, 2026, the SWMR harness adds a second layer of correctness
+gating so future local and object-store numbers are validity-checked against
+the intended scan shape instead of only checking for non-empty results.
+
+Reference rerun note:
+
+- `benches/compaction/results/swmr_gb_scale_2026-03-28.md`
+
+Reference artifact:
+
+- `target/tonbo-bench/compaction_local-1774729594256-2047627.json`
+
+The harness now records, per reader class:
+
+- key band (`hot` or `warm`)
+- validation model
+- expected rows per scan
+- expected first key
+- expected last key
+- expected key fingerprint
+
+Validation model used:
+
+- `pinned_light`, `pinned_heavy`, and `head_heavy` use
+  `exact_shape_stable`
+- `head_light` uses `count_and_key_band`
+
+Why `head_light` is treated differently:
+
+- the workload intentionally deletes from the hot range while the benchmark is
+  running,
+- that can legitimately move the exact first `256` visible hot keys without
+  meaning the harness scanned the wrong slice,
+- the useful invariant there is therefore:
+  - rows stay at the expected limit
+  - every returned key remains in the intended `hot-*` family
+
+Updated local `~1 GB` cell:
+
+| Cell | Mean Step (ms) | p95 Step (ms) | Throughput | Writer Mean (ms) | Head Light (ms) | Head Heavy (ms) | Pinned Light (ms) | Pinned Heavy (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `local, ~1 GB logical` | `168.61` | `237.65` | `47.07 Krows/s` | `139.77` | `4.88` | `13.96` | `1.76` | `8.21` |
+
+What the new validity fields prove in that rerun:
+
+- `head_heavy` matched `2048` rows every iteration, stayed in the `warm-*`
+  band, and kept one fingerprint for the whole measured window.
+- `pinned_light` matched its held-snapshot row count, first/last keys, and key
+  fingerprint for the full run.
+- `pinned_heavy` matched its held-snapshot row count, first/last keys, and key
+  fingerprint for the full run.
+- `head_light` remained valid under the declared model:
+  - `256` rows every iteration
+  - every key stayed in the `hot-*` family
+  - the fingerprint changed across iterations, which is expected because hot
+    deletes can reshape the leading visible slice
+
+What the manifest-reconstruction comparison still proves:
+
+- the old `snapshot_at(manifest_version.timestamp)` substitute is invalid for
+  the heavy readers in this workload shape:
+  - `head_heavy = 0 rows`
+  - `pinned_heavy = 0 rows`
+- the artifact now records those failures as full shape mismatches, not just as
+  a non-zero/zero difference.
+
+Object-store parity and cleanup:
+
+- The same SWMR correctness checks are now applied on the object-store backend
+  in code for the `1 GB` cell.
+- No object-store `1 GB` run was executed in this session because no
+  `TONBO_S3_*` or `AWS_*` credentials were present in the benchmark shell.
+- The benchmark now performs best-effort workspace cleanup after the run:
+  - local/object-store scenario data under the benchmark workspace or prefix is
+    removed
+  - the JSON artifact under `target/tonbo-bench/` remains
+
+Current conclusion after the March 28 follow-up:
+
+- Local `1 GB` SWMR numbers are now guarded by a more defensible correctness
+  contract than simple non-empty scans.
+- These checks prove stable pinned-snapshot keysets and stable warm-band HEAD
+  shape for the measured run.
+- These checks still do not prove reopen-time pinned historical durability for
+  the benchmark path, and they do not yet prove object-store behavior until the
+  `1 GB` object-store cell is executed.
+
+### SWMR Object-Store 1 GB
+
+As of March 29, 2026, this branch now includes both:
+
+- one longer object-store `1 GB` benchmark session that also ran additional
+  benchmark scenarios, and
+- one clean isolated object-store `1 GB` `swmr_gb_scale_mixed` cell
+
+Reference run note:
+
+- `benches/compaction/results/swmr_gb_scale_2026-03-29.md`
+
+Reference artifacts:
+
+- mixed long session:
+  `target/tonbo-bench/compaction_local-1774733239775-2053617.json`
+- clean isolated object-store SWMR cell:
+  `target/tonbo-bench/compaction_local-1774810066470-2135436.json`
+
+Why there are two March 29 object-store artifacts:
+
+- the first successful object-store session also ran
+  `read_while_compaction` and
+  `write_throughput_vs_compaction_frequency`, so it is useful as a longer
+  `1 GB` object-store benchmark session but not as a pure SWMR-only artifact,
+- the follow-up rerun explicitly disabled those scenario families so only
+  `swmr_gb_scale_mixed` executed
+
+Clean isolated object-store `1 GB` SWMR numbers:
+
+| Cell | Mean Step (s) | p95 Step (s) | Throughput | Writer Mean (s) | Head Light (s) | Head Heavy (s) | Pinned Light (s) | Pinned Heavy (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `object_store, ~1 GB logical` | `22.99` | `27.06` | `345.13 rows/s` | `14.75` | `1.94` | `3.50` | `0.55` | `2.26` |
+
+Correctness outcome in the clean object-store cell:
+
+- all four reader classes were `valid = true`
+- `head_heavy`, `pinned_light`, and `pinned_heavy` each held one key
+  fingerprint across the measured window
+- `head_light` remained valid under `count_and_key_band`
+- the manifest-version reconstruction remained invalid for the heavy readers:
+  - `head_heavy = 0 rows`
+  - `pinned_heavy = 0 rows`
+
+This matters because it means the held-snapshot correctness work was not only a
+local-filesystem fix; it also changes whether object-store SWMR numbers are
+trustworthy.
+
+Comparison with the longer mixed object-store session:
+
+- mixed long session SWMR mean step: `24.03 s`
+- clean isolated SWMR mean step: `22.99 s`
+- mixed long session writer mean: `15.88 s`
+- clean isolated SWMR writer mean: `14.75 s`
+
+Interpretation:
+
+- the clean isolated object-store cell and the longer mixed object-store
+  session tell the same SWMR story:
+  - object-store `1 GB` SWMR is correctness-valid in this environment
+  - writer latency dominates the mixed-step budget
+  - object-store is dramatically slower than local for this workload shape
+- the longer mixed session did not materially change the SWMR conclusion; its
+  value was mostly operational:
+  - it exposed how easily a broad benchmark session can accidentally include
+    unrelated scenario families,
+  - it exercised remote cleanup and remote-failure behavior over a longer wall
+    time,
+  - it acted more like a light soak run than a better SWMR decision artifact
+
+What this implies for future benchmarking:
+
+- for routine iteration and PR-facing evidence, the isolated SWMR cell is the
+  more valuable benchmark product:
+  - it is easier to interpret,
+  - it finishes sooner,
+  - it reaches the same SWMR conclusion as the longer mixed session
+- longer `1 GB` object-store sessions still have occasional value as soak or
+  operational checks, but they should be treated as a separate benchmark class
+  rather than the default path for answering the SWMR question
+
+Current SWMR conclusion across local and object-store `1 GB` cells:
+
+- The branch now has correctness-gated `1 GB` evidence on both local and
+  object-store backends.
+- The benchmark now provides trustworthy `1 GB` SWMR numbers within its current
+  scope.
+- The local and object-store cells support the same qualitative result:
+  HEAD and pinned readers remain shape-valid, and writer latency dominates the
+  mixed-step budget on both backends.
+- The main performance lesson from the clean object-store run is not a reader
+  correctness problem; it is that Tonbo is currently hitting a very large fixed
+  write-path cost wall in this environment.
+
+What this PR teaches about Tonbo:
+
+- Tonbo's current SWMR read semantics are stable enough to benchmark at `1 GB`
+  on both local and object-store backends.
+- Pinned snapshots are not the performance bottleneck exposed by these runs.
+- The main bottleneck exposed by object-store SWMR at `1 GB` is fixed remote
+  write-path cost, with read cost materially lower but still shaped by large
+  remote setup overheads.
+- Longer `1 GB` object-store sessions did not materially change the SWMR
+  conclusion relative to the isolated clean SWMR cell, so the smaller scoped
+  run is the better default PR artifact.
+
+Suggested follow-up actions:
+
+- First: instrument and investigate the object-store write path so we can say
+  exactly where the fixed cost is going.
+  Candidate buckets include WAL upload/publication, manifest publication, SST
+  upload/commit, and any benchmark-side setup overhead folded into write steps.
+- Add an optional artifact-only benchmark mode that skips Criterion when the
+  goal is to get one remote `1 GB` answer quickly rather than a statistical
+  benchmark report.
+- Keep isolated SWMR object-store runs as an explicit optional mode so broader
+  benchmark sessions do not accidentally contaminate SWMR artifacts.
+- Add topology metadata to object-store artifacts so remote numbers can be read
+  in the context of runner region, bucket region, and network placement.
+- Keep longer object-store runs as an optional soak-style benchmark class
+  rather than the default way to answer the SWMR question.
+
 ## Scenario Under Test
 
 Current PR-facing scenario:
@@ -182,6 +778,41 @@ Therefore:
 - use logical live-set for compaction effectiveness,
 - use physical bytes for GC/debug interpretation.
 
+### Validated: GC can materially shrink physical SST footprint without showing a steady-state latency win
+
+The branch-local SST GC rerun in
+`benches/compaction/results/sst_gc_rerun_2026-03-19.md` adds the missing cleanup-cost view.
+
+What it validates:
+
+- in the kept local `scale=20` read-focused scenario, prior background sweeps deleted
+  `251,362,341` bytes across `230` obsolete SST objects before the final observation point,
+- those GC sweeps consumed `2,498 ms` of wall-clock time during setup, while total setup took
+  `79,402 ms`, so GC accounted for about `3.15%` of setup elapsed time,
+- without those earlier sweeps, the scenario would have been carrying `257,848,523` bytes of
+  physical SST data at the observation point, versus the `6,486,182` bytes actually present after
+  reclaim,
+- even with that large reduction in physical SST footprint, the paired steady-state read latency
+  only moved by about `-1.04%` in the final cleaned-up state.
+
+Interpretation:
+
+- GC can be highly valuable for physical storage cost and bounded object count,
+- in this scenario, a much larger amount of dead physical SST data did not produce a measurable
+  steady-state read-latency penalty,
+- that benefit does not by itself imply a measurable steady-state latency win in this harness,
+- and the observed sweep work in this run landed on the compaction/setup path rather than in the
+  measured foreground operation.
+
+The same rerun also refined the write-side conclusion:
+
+- cumulative SST reclaim still remained small relative to setup cost in the write-heavy scenario,
+- the paired write run moved to `-5.19%` mean latency for `write_heavy_with_sst_sweep` relative to
+  `write_heavy_no_sst_sweep`,
+- but that shift is still too small and noisy to treat as a clear foreground GC win on its own,
+- and the artifact shows one additional sweep overlapping the observation window rather than a
+  stable measured write-path speedup caused by explicit foreground reclaim.
+
 ## Inconclusive Or Blocked Conclusions
 
 ### Inconclusive: object-store root cause
@@ -200,9 +831,82 @@ What we cannot yet say:
 - whether the main blocker is network path, object-store request overhead, snapshot/setup cost,
   small-object amplification, or deployment topology.
 
+### First Surface Benchmark Follow-up
+
+This branch now also has a first narrow `surface` benchmark follow-up aligned
+with the benchmark-program split between `micro`, `engine`, and `surface`
+scenarios.
+
+Scenario:
+
+- `surface_open_and_fresh_read`
+
+Shape:
+
+- measure `begin_snapshot` as a first-pass open/snapshot cost,
+- measure one selective HEAD read with a small projection,
+- measure one heavier HEAD read,
+- measure one foreground write with write-path profiling,
+- measure one follow-up selective HEAD read after that write to capture a
+  write-to-visible surface cost.
+
+This is intentionally closer to a user-facing interactive path than
+`read_compaction_quiesced`, but it is still **not** a filesystem benchmark and
+should not be read as one.
+
+Reference artifacts:
+
+- local first-pass surface run:
+  `target/tonbo-bench/compaction_local-1776243351814-1413746.json`
+- object-store first-pass surface run:
+  `target/tonbo-bench/compaction_local-1776258928896-1523209.json`
+
+First local vs standard-S3 surface comparison:
+
+| Metric | Local | Standard S3 | Ratio |
+| --- | ---: | ---: | ---: |
+| whole surface op mean | `14.08 ms` | `11.321 s` | `804x` |
+| `begin_snapshot` | `0.87 ms` | `534.87 ms` | `613x` |
+| latest light read | `2.91 ms` | `2.921 s` | `1004x` |
+| latest heavy read | `5.68 ms` | `3.746 s` | `659x` |
+| foreground write | `1.86 ms` | `1.207 s` | `649x` |
+| write-to-visible follow-up | `4.60 ms` | `4.118 s` | `894x` |
+
+Read-path split in the object-store surface run:
+
+- latest light read:
+  - prepare: `2919.80 ms`
+  - consume: `0.78 ms`
+- latest heavy read:
+  - prepare: `3742.38 ms`
+  - consume: `3.48 ms`
+- fresh light read after write:
+  - prepare: `2910.10 ms`
+  - consume: `0.49 ms`
+
+Interpretation:
+
+- The severe object-store penalty is not limited to the earlier
+  compaction-focused engine cell.
+- A narrower user-facing open/fresh-read proxy also lands in a
+  hundreds-to-about-a-thousand-times slowdown regime relative to local.
+- As with the earlier engine-layer results, the observed penalty is still
+  overwhelmingly prepare/setup dominated rather than row-consume dominated.
+
+Limits of this surface follow-up:
+
+- It is one first-pass API-surface scenario only.
+- It does **not** reproduce recursive directory traversal, filesystem metadata
+  walks, or content search.
+- It does **not** yet isolate whether the dominant prepare cost is snapshot
+  resolution, manifest work, object-store requests, or deployment path.
+- It should therefore be read as a closer user-facing proxy than
+  `read_compaction_quiesced`, not as the final product-surface benchmark.
+
 ### Blocked: broad product scenario claims
 
-This branch validates `read after compaction` only. It does not yet validate the live-engine
+This branch now validates one narrow engine-layer compaction scenario plus one
+first-pass surface scenario. It still does not yet validate the broader live-engine
 scenarios that matter most for Tonbo positioning:
 
 - interleaved reads and writes,
@@ -218,10 +922,27 @@ The current scenario supports one specific claim:
 - Tonbo compaction already improves read behavior on local storage and should continue to matter for
   larger live analytical workloads.
 
-The current scenario does **not** yet support a broad external claim that Tonbo is already tuned for
-serverless object-store analytics under live mixed traffic.
+The current branch also supports one narrower additional claim:
+
+- user-facing open/fresh-read behavior on the current object-store path can
+  degrade by hundreds to about a thousand times relative to local, and the
+  observed penalty is still strongly setup-dominated in the first surface
+  benchmark.
+
+The current branch does **not** yet support a broad external claim that Tonbo
+is already tuned for serverless object-store analytics under live mixed traffic
+or that it has already closed the gap on richer product-surface workloads.
 
 The gap between those statements is exactly what the next scenarios must close.
+
+A local attribution pass for `swmr_gb_scale_mixed` at `~1 GB` also
+clarified the current writer cost shape. In that local smoke run, the
+foreground writer path was dominated by inline minor compaction (`229.18 ms`)
+and WAL durability (`218.31 ms` combined append + commit), with mutable insert
+materially smaller (`109.17 ms`). This should be read as local attribution, not
+as a final object-store percentage claim, but it strengthens the current
+conclusion that the next useful work is write/setup-path instrumentation rather
+than more topology hunting.
 
 For positioning, the target comparison set is not only embedded analytical engines. It is also
 systems that care about object-store-native or serverless execution economics, including:
@@ -265,3 +986,4 @@ Treat the documents below as appendices and raw evidence, not as the primary PR 
 - `benches/compaction/results/compaction_local_baseline.md`
 - `benches/compaction/results/compaction_directional_matrix_2026-02-27.md`
 - `benches/compaction/results/compaction_directional_phase_split_2026-03-01.md`
+- `benches/compaction/results/sst_gc_rerun_2026-03-19.md`

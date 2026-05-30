@@ -20,12 +20,16 @@ use typed_arrow_dyn::{
 #[cfg(all(test, feature = "tokio"))]
 use crate::manifest::{TableHead, VersionState};
 use crate::{
-    db::{DBError, DbInner, DynDbHandle, ScanBuilder, TxnWalPublishContext, WalFrameRange},
+    db::{
+        DBError, DbInner, DynDbHandle, ScanBuilder, SnapshotPinGuard, TxnWalPublishContext,
+        WalFrameRange,
+    },
     extractor::{KeyExtractError, KeyProjection, row_from_batch},
     key::{KeyOwned, KeyTsViewRaw},
     manifest::{ManifestError, TableSnapshot, VersionEdit},
     mutation::DynMutation,
     mvcc::{ReadView, Timestamp},
+    ondisk::sstable::SsTableError,
     query::stream::StreamError,
     wal::{WalError, manifest_ext},
 };
@@ -64,19 +68,30 @@ pub enum SnapshotError {
 pub struct Snapshot {
     read_view: ReadView,
     manifest: TableSnapshot,
+    _manifest_pin: Option<SnapshotPinGuard>,
 }
 
 impl Snapshot {
-    pub(crate) fn from_table_snapshot(read_view: ReadView, manifest: TableSnapshot) -> Self {
+    pub(crate) fn from_table_snapshot(
+        read_view: ReadView,
+        manifest: TableSnapshot,
+        manifest_pin: Option<SnapshotPinGuard>,
+    ) -> Self {
         Self {
             read_view,
             manifest,
+            _manifest_pin: manifest_pin,
         }
     }
 
     /// MVCC visibility guard captured when the snapshot was created.
     pub(crate) fn read_view(&self) -> ReadView {
         self.read_view
+    }
+
+    /// MVCC read timestamp captured when the snapshot was created.
+    pub fn read_timestamp(&self) -> Timestamp {
+        self.read_view.read_ts()
     }
 
     /// Manifest head describing the table state visible to the snapshot.
@@ -615,6 +630,7 @@ where
             )?)
         };
 
+        let mut maintenance_deferred = false;
         if let Some(wal) = db.wal_handle().cloned() {
             let provisional_id = wal.next_provisional_id();
             let prev_live_floor = db.wal_live_frame_floor();
@@ -640,10 +656,6 @@ where
                     publish_ctx.finalize_manifest(wal_range).await?;
                 }
                 CommitAckMode::Fast => {
-                    // NOTE: Fast mode has a known limitation - if auto-seal triggers during
-                    // apply_staged_payloads, the sealed segment's WAL range won't include this
-                    // transaction's frames (they're recorded asynchronously). This is acceptable
-                    // for Fast mode as it prioritizes latency over strict durability ordering.
                     apply_staged_payloads(
                         &*db,
                         upsert_payload.take(),
@@ -652,7 +664,8 @@ where
                     )?;
                     let publish_ctx = db.txn_publish_context(prev_live_floor);
                     let executor = Arc::clone(db.executor());
-                    spawn_publish_task(executor, publish_ctx, tickets);
+                    spawn_publish_task(executor, Arc::clone(&db), publish_ctx, tickets);
+                    maintenance_deferred = true;
                 }
             }
         } else {
@@ -673,6 +686,10 @@ where
                 delete_payload.take(),
                 commit_ts,
             )?;
+        }
+
+        if !maintenance_deferred {
+            run_post_commit_maintenance(&db).await?;
         }
 
         drop(key_guards);
@@ -1190,6 +1207,71 @@ mod tests {
         assert_eq!(results[1].0, KeyOwned::from("bb"));
         assert_eq!(results[2].0, KeyOwned::from("cc"));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_triggers_seal_when_policy_met() {
+        let (db, _schema) =
+            make_db_with_policy(Some(Arc::new(BatchesThreshold { batches: 1 }))).await;
+
+        assert_eq!(db.inner().num_immutable_segments(), 0);
+
+        let mut tx: TestTx = db.begin_transaction().await.expect("tx");
+        tx.upsert(DynRow(vec![
+            Some(DynCell::Str("k1".into())),
+            Some(DynCell::I32(1)),
+        ]))
+        .expect("stage row");
+        tx.commit().await.expect("commit");
+
+        // The commit should have triggered maybe_seal_after_insert, which with
+        // BatchesThreshold { batches: 1 } should seal the mutable memtable.
+        assert!(
+            db.inner().num_immutable_segments() >= 1,
+            "transaction commit should trigger sealing when policy threshold is met"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_does_not_seal_when_policy_not_met() {
+        // Use default policy (very high thresholds) so a single row won't trigger sealing.
+        let (db, _schema) = make_db().await;
+
+        let mut tx: TestTx = db.begin_transaction().await.expect("tx");
+        tx.upsert(DynRow(vec![
+            Some(DynCell::Str("k1".into())),
+            Some(DynCell::I32(1)),
+        ]))
+        .expect("stage row");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            db.inner().num_immutable_segments(),
+            0,
+            "default policy should not seal after a single small transaction"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_data_visible_after_seal() {
+        let (db, _schema) =
+            make_db_with_policy(Some(Arc::new(BatchesThreshold { batches: 1 }))).await;
+
+        let mut tx: TestTx = db.begin_transaction().await.expect("tx");
+        tx.upsert(DynRow(vec![
+            Some(DynCell::Str("sealed-key".into())),
+            Some(DynCell::I32(42)),
+        ]))
+        .expect("stage row");
+        tx.commit().await.expect("commit");
+
+        // Data committed via transaction should be readable even after being sealed
+        // into an immutable segment.
+        let predicate = all_rows_predicate();
+        let batches = db.scan().filter(predicate).collect().await.expect("scan");
+        let rows = extract_rows(&batches);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("sealed-key".to_string(), 42));
+    }
 }
 
 async fn write_wal_transaction<E>(
@@ -1279,6 +1361,7 @@ impl AckRange {
 
 fn spawn_publish_task<FS, E>(
     executor: Arc<E>,
+    db: Arc<DbInner<FS, E>>,
     publish_ctx: TxnWalPublishContext<FS, E>,
     tickets: WalTxnTickets<E>,
 ) where
@@ -1289,7 +1372,11 @@ fn spawn_publish_task<FS, E>(
     executor.spawn(async move {
         match tickets.await_range().await {
             Ok(range) => {
-                if let Err(err) = publish_ctx.finalize(range).await {
+                publish_ctx.record_wal_range(&range);
+                if let Err(err) = run_post_commit_maintenance(&db).await {
+                    eprintln!("transaction post-commit maintenance failed: {err}");
+                }
+                if let Err(err) = publish_ctx.finalize_manifest(range).await {
                     eprintln!("transaction post-commit publish failed: {err}");
                 }
             }
@@ -1371,15 +1458,25 @@ where
 
         Ok(())
     }
+}
 
-    /// Combined record and finalize for async publish tasks.
-    ///
-    /// This is used by the Fast mode async task which handles both
-    /// WAL range recording and manifest update together.
-    async fn finalize(&self, wal_range: WalFrameRange) -> Result<(), TransactionCommitError> {
-        self.record_wal_range(&wal_range);
-        self.finalize_manifest(wal_range).await
-    }
+async fn run_post_commit_maintenance<FS, E>(
+    db: &Arc<DbInner<FS, E>>,
+) -> Result<(), TransactionCommitError>
+where
+    FS: crate::manifest::ManifestFs<E>,
+    E: Executor + Timer + Clone + 'static,
+    <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
+{
+    db.maybe_seal_after_insert()
+        .map_err(TransactionCommitError::Apply)?;
+    #[cfg(test)]
+    db.maybe_run_minor_compaction()
+        .await
+        .map_err(TransactionCommitError::MinorCompaction)?;
+    #[cfg(not(test))]
+    DbInner::schedule_background_minor_compaction(Arc::clone(db));
+    Ok(())
 }
 
 /// Errors raised while staging transactional mutations.
@@ -1473,4 +1570,7 @@ pub enum TransactionCommitError {
         /// Zero-based component index that was null.
         index: usize,
     },
+    /// Minor compaction failed after commit.
+    #[error("minor compaction failed: {0}")]
+    MinorCompaction(#[from] SsTableError),
 }

@@ -28,6 +28,16 @@ pub struct S3Harness {
     pub wal_config: WalConfig,
 }
 
+type S3Env = (
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<String>,
+);
+
 /// Common WAL tuning for e2e forcing small segments and fast flush.
 pub fn wal_tuning(policy: WalSyncPolicy) -> WalConfig {
     WalConfig::default()
@@ -80,14 +90,20 @@ pub fn local_harness(
     })
 }
 
-fn s3_env() -> Option<(String, String, String, String, String, Option<String>)> {
-    let endpoint = env::var("TONBO_S3_ENDPOINT").ok()?;
+fn s3_env() -> Option<S3Env> {
+    let endpoint = env::var("TONBO_S3_ENDPOINT").ok();
     let bucket = env::var("TONBO_S3_BUCKET").ok()?;
     let region = env::var("TONBO_S3_REGION").ok()?;
     let access = env::var("TONBO_S3_ACCESS_KEY").ok()?;
     let secret = env::var("TONBO_S3_SECRET_KEY").ok()?;
+    let s3_express = matches!(
+        env::var("TONBO_S3_EXPRESS").ok().as_deref(),
+        Some("1" | "true" | "TRUE")
+    );
     let session = env::var("TONBO_S3_SESSION_TOKEN").ok();
-    Some((endpoint, bucket, region, access, secret, session))
+    Some((
+        endpoint, bucket, region, access, secret, s3_express, session,
+    ))
 }
 
 fn unique_label(base: &str) -> String {
@@ -103,7 +119,7 @@ pub fn maybe_s3_harness(
     label: &str,
     wal_cfg: WalConfig,
 ) -> Result<Option<S3Harness>, Box<dyn std::error::Error>> {
-    let Some((endpoint, bucket, region, access, secret, session)) = s3_env() else {
+    let Some((endpoint, bucket, region, access, secret, s3_express, session)) = s3_env() else {
         return Ok(None);
     };
 
@@ -113,8 +129,9 @@ pub fn maybe_s3_harness(
     };
 
     let mut s3 = S3Spec::new(bucket.clone(), unique_label(label), credentials);
-    s3.endpoint = Some(endpoint);
+    s3.endpoint = endpoint;
     s3.region = Some(region);
+    s3.s3_express = Some(s3_express);
     s3.sign_payload = Some(true);
 
     let object = ObjectSpec::s3(s3);

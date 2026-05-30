@@ -6,6 +6,11 @@ This benchmark suite lives in `benches/compaction_local.rs` and now supports:
 - Backend selection (`local` vs `object_store`).
 - Tail latency reporting (p50/p95/p99 in addition to mean).
 - A directional report block for `read_baseline` vs `read_compaction_quiesced`.
+- A first-pass `surface_open_and_fresh_read` scenario for snapshot/open,
+  selective HEAD reads, and write-to-visible follow-up reads.
+
+For the SST-GC pre-enablement baseline workflow, use
+`benches/compaction/sst_gc_baseline.md`.
 
 ## Program Context
 
@@ -35,6 +40,28 @@ and scenario design should evolve toward that larger program.
 
 - `TONBO_BENCH_OBJECT_PREFIX` (optional; default: `tonbo-bench`)
   - Prefix used for object-store benchmark runs.
+
+- Topology metadata env vars (optional, but recommended for cross-environment comparison)
+  - `TONBO_BENCH_RUNNER_ENV`
+    - Example: `dev`, `ec2`
+  - `TONBO_BENCH_RUNNER_REGION`
+    - Example: `eu-central-1`
+  - `TONBO_BENCH_RUNNER_AZ`
+    - Example: `euc1-az1` or `eu-central-1a` if AZ ID is not available
+  - `TONBO_BENCH_RUNNER_INSTANCE_TYPE`
+    - Example: `c7i.large`
+  - `TONBO_BENCH_BUCKET_REGION`
+    - Region of the target bucket
+  - `TONBO_BENCH_BUCKET_AZ`
+    - Directory-bucket zone for S3 Express cells
+  - `TONBO_BENCH_OBJECT_STORE_FLAVOR`
+    - Example: `standard_s3`, `s3_express`
+  - `TONBO_BENCH_ENDPOINT_KIND`
+    - Example: `regional`, `zonal`, `custom`
+  - `TONBO_BENCH_NETWORK_PATH`
+    - Example: `public_internet`, `vpc_gateway_endpoint`
+  - `TONBO_BENCH_MEDIAN_RTT_MS`
+    - Optional measured median RTT for the runner -> endpoint path
 
 ## Object-Store Configuration
 
@@ -66,6 +93,15 @@ LocalFS, larger dataset:
 TONBO_BENCH_DATASET_SCALE=10 cargo bench -p tonbo -- <...>
 ```
 
+LocalFS, first-pass surface benchmark only:
+
+```bash
+TONBO_BENCH_BACKEND=local \
+TONBO_COMPACTION_BENCH_ARTIFACT_ITERATIONS=3 \
+TONBO_COMPACTION_BENCH_CRITERION_SAMPLE_SIZE=10 \
+cargo bench -p tonbo --bench compaction_local -- surface_open_and_fresh_read --nocapture
+```
+
 Object store (if configured):
 
 ```bash
@@ -88,6 +124,41 @@ Set S3 target:
 ```bash
 export TONBO_S3_BUCKET=tonbo-smoke-euc1-232814779190-1772115011
 export TONBO_S3_REGION=eu-central-1
+```
+
+Set topology fields for a standard regional S3 run from a developer machine:
+
+```bash
+export TONBO_BENCH_RUNNER_ENV=dev
+export TONBO_BENCH_RUNNER_REGION=eu-central-1
+export TONBO_BENCH_BUCKET_REGION=eu-central-1
+export TONBO_BENCH_OBJECT_STORE_FLAVOR=standard_s3
+export TONBO_BENCH_ENDPOINT_KIND=regional
+export TONBO_BENCH_NETWORK_PATH=public_internet
+```
+
+Matrix helper script:
+
+```bash
+chmod +x benches/compaction/run_matrix.sh
+```
+
+Example: run only the developer-machine cells and generate a report under
+`target/tonbo-bench/reports/`:
+
+```bash
+export TONBO_MATRIX_CELLS=dev_local,dev_s3
+export TONBO_MATRIX_STD_S3_BUCKET=tonbo-smoke-euc1-232814779190-1772115011
+export TONBO_MATRIX_STD_S3_REGION=eu-central-1
+benches/compaction/run_matrix.sh
+```
+
+Example: print the EC2 commands without executing them:
+
+```bash
+export TONBO_MATRIX_RUN_MODE=print
+export TONBO_MATRIX_CELLS=ec2_s3,ec2_s3express
+benches/compaction/run_matrix.sh
 ```
 
 Run a directional cell:
@@ -113,6 +184,137 @@ TONBO_BENCH_BACKEND=local TONBO_BENCH_DATASET_SCALE=10 TONBO_COMPACTION_BENCH_IN
 TONBO_BENCH_BACKEND=object_store TONBO_BENCH_DATASET_SCALE=1  TONBO_COMPACTION_BENCH_INGEST_BATCHES=640 TONBO_BENCH_OBJECT_PREFIX=tonbo-dir-object_store-s1-$(date +%s)  cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
 TONBO_BENCH_BACKEND=object_store TONBO_BENCH_DATASET_SCALE=10 TONBO_COMPACTION_BENCH_INGEST_BATCHES=640 TONBO_BENCH_OBJECT_PREFIX=tonbo-dir-object_store-s10-$(date +%s) cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
 ```
+
+Cross-environment comparison matrix for this branch, using smaller first-pass scales:
+
+```bash
+# Common first-pass scale knobs. These are intended to keep runs cheap while still
+# exposing remote latency floors and compaction/read directionality.
+export TONBO_COMPACTION_BENCH_ROWS_PER_BATCH=64
+export TONBO_COMPACTION_BENCH_INGEST_BATCHES=160
+export TONBO_COMPACTION_BENCH_ARTIFACT_ITERATIONS=12
+export TONBO_COMPACTION_BENCH_CRITERION_SAMPLE_SIZE=10
+export TONBO_COMPACTION_BENCH_ENABLE_READ_WHILE_COMPACTION=0
+export TONBO_COMPACTION_BENCH_ENABLE_WRITE_THROUGHPUT_VS_COMPACTION_FREQUENCY=0
+
+# Cell 1: dev machine, local
+TONBO_BENCH_BACKEND=local \
+TONBO_BENCH_DATASET_SCALE=1 \
+TONBO_BENCH_RUNNER_ENV=dev \
+TONBO_BENCH_OBJECT_STORE_FLAVOR=local_fs \
+cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
+
+# Cell 2: dev machine, standard S3
+TONBO_BENCH_BACKEND=object_store \
+TONBO_BENCH_DATASET_SCALE=1 \
+TONBO_BENCH_OBJECT_PREFIX=tonbo-compare-dev-s3-s1-$(date +%s) \
+TONBO_BENCH_RUNNER_ENV=dev \
+TONBO_BENCH_RUNNER_REGION=eu-central-1 \
+TONBO_BENCH_BUCKET_REGION=eu-central-1 \
+TONBO_BENCH_OBJECT_STORE_FLAVOR=standard_s3 \
+TONBO_BENCH_ENDPOINT_KIND=regional \
+TONBO_BENCH_NETWORK_PATH=public_internet \
+cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
+
+# Cell 3: dev machine, S3 Express smoke-test only. This requires a real directory
+# bucket endpoint and may need a CreateSession-capable client path before it works.
+TONBO_BENCH_BACKEND=object_store \
+TONBO_BENCH_DATASET_SCALE=1 \
+TONBO_BENCH_OBJECT_PREFIX=tonbo-compare-dev-s3express-s1-$(date +%s) \
+TONBO_BENCH_RUNNER_ENV=dev \
+TONBO_BENCH_RUNNER_REGION=eu-central-1 \
+TONBO_BENCH_BUCKET_REGION=eu-central-1 \
+TONBO_BENCH_BUCKET_AZ=euc1-az1 \
+TONBO_BENCH_OBJECT_STORE_FLAVOR=s3_express \
+TONBO_BENCH_ENDPOINT_KIND=zonal \
+TONBO_BENCH_NETWORK_PATH=public_internet \
+TONBO_S3_ENDPOINT=<directory-bucket-zonal-endpoint> \
+cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
+
+# Cell 4: EC2 same-region, standard S3
+TONBO_BENCH_BACKEND=object_store \
+TONBO_BENCH_DATASET_SCALE=1 \
+TONBO_BENCH_OBJECT_PREFIX=tonbo-compare-ec2-s3-s1-$(date +%s) \
+TONBO_BENCH_RUNNER_ENV=ec2 \
+TONBO_BENCH_RUNNER_REGION=eu-central-1 \
+TONBO_BENCH_RUNNER_AZ=euc1-az1 \
+TONBO_BENCH_RUNNER_INSTANCE_TYPE=c7i.large \
+TONBO_BENCH_BUCKET_REGION=eu-central-1 \
+TONBO_BENCH_OBJECT_STORE_FLAVOR=standard_s3 \
+TONBO_BENCH_ENDPOINT_KIND=regional \
+TONBO_BENCH_NETWORK_PATH=vpc_gateway_endpoint \
+cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
+
+# Cell 5: EC2 same-AZ, S3 Express
+TONBO_BENCH_BACKEND=object_store \
+TONBO_BENCH_DATASET_SCALE=1 \
+TONBO_BENCH_OBJECT_PREFIX=tonbo-compare-ec2-s3express-s1-$(date +%s) \
+TONBO_BENCH_RUNNER_ENV=ec2 \
+TONBO_BENCH_RUNNER_REGION=eu-central-1 \
+TONBO_BENCH_RUNNER_AZ=euc1-az1 \
+TONBO_BENCH_RUNNER_INSTANCE_TYPE=c7i.large \
+TONBO_BENCH_BUCKET_REGION=eu-central-1 \
+TONBO_BENCH_BUCKET_AZ=euc1-az1 \
+TONBO_BENCH_OBJECT_STORE_FLAVOR=s3_express \
+TONBO_BENCH_ENDPOINT_KIND=zonal \
+TONBO_BENCH_NETWORK_PATH=vpc_gateway_endpoint \
+TONBO_S3_ENDPOINT=<directory-bucket-zonal-endpoint> \
+cargo bench -p tonbo --bench compaction_local -- read_compaction_quiesced --nocapture
+```
+
+The helper script uses the same cell names:
+
+- `dev_local`
+- `dev_s3`
+- `dev_s3express`
+- `ec2_s3`
+- `ec2_s3express`
+
+Cell-specific environment expected by `run_matrix.sh`:
+
+- Standard S3 cells:
+  - `TONBO_MATRIX_STD_S3_BUCKET`
+  - `TONBO_MATRIX_STD_S3_REGION`
+  - optional `TONBO_MATRIX_STD_S3_ENDPOINT`
+- S3 Express cells:
+  - `TONBO_MATRIX_EXPRESS_S3_BUCKET`
+  - `TONBO_MATRIX_EXPRESS_S3_REGION`
+  - `TONBO_MATRIX_EXPRESS_S3_ENDPOINT`
+  - `TONBO_MATRIX_EXPRESS_S3_BUCKET_AZ`
+  - `run_matrix.sh` now preflights both the regional control endpoint
+    (`s3express-control.<region>.amazonaws.com`) and the configured zonal endpoint.
+    If either hostname does not resolve from the current host, the Express cell is
+    marked `skipped` in the report instead of failing mid-run.
+- Credentials:
+  - either `TONBO_S3_ACCESS_KEY` / `TONBO_S3_SECRET_KEY`
+  - or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+- Optional host metadata overrides:
+  - `TONBO_MATRIX_DEV_RUNNER_REGION`
+  - `TONBO_MATRIX_DEV_RUNNER_AZ`
+  - `TONBO_MATRIX_EC2_RUNNER_REGION`
+  - `TONBO_MATRIX_EC2_RUNNER_AZ`
+  - `TONBO_MATRIX_EC2_INSTANCE_TYPE`
+  - `TONBO_MATRIX_DEV_MEDIAN_RTT_MS`
+  - `TONBO_MATRIX_EC2_MEDIAN_RTT_MS`
+
+Suggested first-pass scales:
+
+- `TONBO_BENCH_DATASET_SCALE=1`
+- `TONBO_BENCH_DATASET_SCALE=4`
+- `TONBO_BENCH_DATASET_SCALE=8`
+
+These scales are usually enough to expose:
+
+- fixed remote setup cost,
+- regional vs zonal latency floor differences,
+- whether compaction meaningfully changes read cost,
+- whether the EC2-in-region / EC2-in-AZ path changes the result materially.
+
+Move to `~1 GB` only if:
+
+- the direction changes at higher scales,
+- the smaller scales are too noisy,
+- or you need stronger throughput claims rather than a first topology comparison.
 
 High-scale object-store tuned profile (reduces small-operation amplification while preserving
 benchmark intent):
@@ -182,6 +384,40 @@ For schema `6+` artifacts, read workloads also include internal setup-stage mean
 These internal setup-stage timers should approximately sum to `mean_prepare_ns` (small residual
 measurement overhead is expected).
 
+The SWMR workload now also includes a writer-phase breakdown:
+
+- `summary.swmr.writer_latency_ns`:
+  - end-to-end writer latency observed by the SWMR mixed step
+- `summary.swmr.writer_path_ns.mean_partition_ns`:
+  - partitioning the mixed batch into upsert/delete payloads
+- `summary.swmr.writer_path_ns.mean_wal_append_submit_ns`:
+  - time to submit WAL append payloads to the writer
+- `summary.swmr.writer_path_ns.mean_wal_append_wait_ns`:
+  - time waiting for WAL append payload durable acks
+- `summary.swmr.writer_path_ns.mean_wal_append_ns`:
+  - total WAL append cost, equal to submit plus durable-wait
+- `summary.swmr.writer_path_ns.mean_wal_commit_submit_ns`:
+  - time to submit the WAL commit marker to the writer
+- `summary.swmr.writer_path_ns.mean_wal_commit_wait_ns`:
+  - time waiting for the WAL commit-marker durable ack
+- `summary.swmr.writer_path_ns.mean_wal_commit_ns`:
+  - total WAL commit cost, equal to submit plus durable-wait
+- `summary.swmr.writer_path_ns.mean_mutable_insert_ns`:
+  - applying rows into the mutable memtable
+- `summary.swmr.writer_path_ns.mean_seal_ns`:
+  - post-insert sealing decision and seal execution
+- `summary.swmr.writer_path_ns.mean_minor_compaction_ns`:
+  - opportunistic minor compaction triggered by the ingest
+- `summary.swmr.writer_path_ns.mean_total_ns`:
+  - profiled end-to-end writer path inside Tonbo
+
+Interpretation guideline:
+
+- if `writer_path_ns.mean_total_ns` is close to `writer_latency_ns.mean`, the slowdown is largely inside Tonbo's measured write path rather than outside harness overhead
+- if `mean_wal_append_wait_ns + mean_wal_commit_wait_ns` dominates, focus on WAL durability and writer flush behavior first
+- if `mean_wal_append_submit_ns + mean_wal_commit_submit_ns` dominates, focus on writer queueing/submission overhead first
+- if `mean_minor_compaction_ns` dominates, focus on flush/manifest publish work before tuning the pure ingest path
+
 For schema `8+` artifacts, setup payloads include both logical and physical volume sections:
 
 - Primary logical live-set view:
@@ -224,6 +460,36 @@ Semantics:
 - Logical should be used as the primary compaction-effectiveness metric because it tracks manifest-visible live state.
 - Physical remains useful for debugging storage amplification and cleanup lag.
 
+For schema `11+` artifacts, setup payloads may also include `setup.gc_observation` for
+GC-enabled scenarios. This captures:
+
+- `volume_before_gc` and `volume_after_gc`
+- `physical_stale_estimate_before_explicit_sweep` and `physical_stale_estimate_after_explicit_sweep`
+- `persisted_plan_before_explicit_sweep` and `persisted_plan_after_explicit_sweep`
+- `reclaimed_sst_objects` and `reclaimed_sst_bytes`
+- `explicit_sweep_result.deleted_objects`
+- `explicit_sweep_result.deleted_bytes`
+- `explicit_sweep_result.delete_failures`
+- `explicit_sweep_result.duration_ms`
+- cumulative counters before/after the explicit sweep, including:
+  `sweep_runs`, `deleted_objects`, `deleted_bytes`, `delete_failures`,
+  `sweep_duration_ms_total`, `gc_plan_write_runs`, `gc_plan_overwrite_non_empty`,
+  `gc_plan_take_runs`, `gc_plan_taken_sst_candidates`,
+  `gc_plan_authorized_sst_candidates`, `gc_plan_blocked_sst_candidates`,
+  `gc_plan_requeued_sst_candidates`
+
+Interpretation:
+
+- `physical_stale_estimate_*` is a physical-vs-logical SST storage delta estimate. It is not the persisted GC plan.
+- `persisted_plan_*` is the manifest GC plan at the explicit sweep observation point, including the currently authorized subset.
+- `explicit_sweep_result.*` is what that explicit benchmark sweep invocation actually deleted.
+- A non-zero `physical_stale_estimate_before_explicit_sweep` with `persisted_plan_before_explicit_sweep = null` means stale-looking SST objects still exist physically, but no persisted plan remained staged for the explicit sweep to consume.
+
+Use these fields to compare a GC-on scenario against its GC-off companion:
+
+- `read_compaction_quiesced` vs `read_compaction_quiesced_after_gc`
+- `write_heavy_no_sst_sweep` vs `write_heavy_with_sst_sweep`
+
 Planned artifact growth for the broader benchmark program:
 
 - topology fields such as runner region, bucket region, path placement, and
@@ -234,6 +500,12 @@ Planned artifact growth for the broader benchmark program:
   depth, CPU, RSS, and network throughput
 - stable configuration snapshots so each run can be traced back to WAL mode,
   compaction settings, and workload shape
+
+Current artifact note:
+
+- schema `11+` artifacts now include a top-level `topology` object populated
+  from the optional `TONBO_BENCH_*` topology env vars above
+- the directional report also prints a one-line topology summary when present
 
 Interpretation guideline:
 
@@ -263,3 +535,5 @@ After `read_baseline` and `read_compaction_quiesced` complete, the harness print
   - `benches/compaction/results/compaction_directional_matrix_2026-02-27.md`
 - Directional + latency phase split validation (new probe wiring + dominance view):
   - `benches/compaction/results/compaction_directional_phase_split_2026-03-01.md`
+- SST GC timing rerun with snapshot-pin semantics:
+  - `benches/compaction/results/sst_gc_rerun_2026-03-19.md`

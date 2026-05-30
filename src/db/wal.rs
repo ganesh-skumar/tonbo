@@ -9,7 +9,7 @@ use arrow_select::take::take;
 use fusio::executor::{Executor, Instant, Timer};
 
 use crate::{
-    db::DbInner,
+    db::{DbInner, WritePathProfile},
     extractor::KeyExtractError,
     inmem::{
         immutable::{ImmutableSegment, memtable::MVCC_COMMIT_COL},
@@ -24,6 +24,14 @@ use crate::{
         frame::{DynAppendEvent, WalEvent},
     },
 };
+
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration
+        .as_nanos()
+        .min(u128::from(u64::MAX))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WalFrameRange {
@@ -200,12 +208,45 @@ where
     }
 
     /// Ingest a batch along with its tombstone bitmap, routing through the WAL when enabled.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ingest_with_tombstones(
         &self,
         batch: RecordBatch,
         tombstones: Vec<bool>,
     ) -> Result<(), KeyExtractError> {
-        insert_dyn_wal_batch(self, batch, tombstones).await
+        self.ingest_with_tombstones_with_profile(batch, tombstones)
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(not(test))]
+    pub async fn ingest_with_tombstones_without_minor_compaction(
+        &self,
+        batch: RecordBatch,
+        tombstones: Vec<bool>,
+    ) -> Result<(), KeyExtractError> {
+        self.ingest_with_tombstones_with_profile_without_minor_compaction(batch, tombstones)
+            .await
+            .map(|_| ())
+    }
+
+    /// Ingest a batch and return a write-path timing breakdown.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn ingest_with_tombstones_with_profile(
+        &self,
+        batch: RecordBatch,
+        tombstones: Vec<bool>,
+    ) -> Result<WritePathProfile, KeyExtractError> {
+        insert_dyn_wal_batch(self, batch, tombstones, true).await
+    }
+
+    #[cfg(not(test))]
+    pub async fn ingest_with_tombstones_with_profile_without_minor_compaction(
+        &self,
+        batch: RecordBatch,
+        tombstones: Vec<bool>,
+    ) -> Result<WritePathProfile, KeyExtractError> {
+        insert_dyn_wal_batch(self, batch, tombstones, false).await
     }
 
     pub(crate) fn replay_wal_events(
@@ -427,31 +468,47 @@ async fn insert_dyn_wal_batch<FS, E>(
     db: &DbInner<FS, E>,
     batch: RecordBatch,
     tombstones: Vec<bool>,
-) -> Result<(), KeyExtractError>
+    run_minor_compaction: bool,
+) -> Result<WritePathProfile, KeyExtractError>
 where
     FS: ManifestFs<E>,
     E: Executor + Timer + Clone,
     <FS as fusio::fs::Fs>::File: fusio::durability::FileCommit,
 {
+    let total_started = Instant::now();
     validate_record_batch_schema(db, &batch)?;
     validate_vec_tombstone_bitmap(&batch, &tombstones)?;
 
     if batch.num_rows() == 0 {
-        return Ok(());
+        return Ok(WritePathProfile {
+            total_ns: duration_ns_u64(total_started.elapsed()),
+            ..WritePathProfile::default()
+        });
     }
 
     let commit_ts = db.next_commit_ts();
 
+    let partition_started = Instant::now();
     let (upsert_batch, delete_batch) =
         partition_batch_for_mutations(db, batch, &tombstones, commit_ts)?;
+    let partition_ns = duration_ns_u64(partition_started.elapsed());
 
     if upsert_batch.is_none() && delete_batch.is_none() {
-        return Ok(());
+        return Ok(WritePathProfile {
+            partition_ns,
+            total_ns: duration_ns_u64(total_started.elapsed()),
+            ..WritePathProfile::default()
+        });
     }
 
+    let mut profile = WritePathProfile {
+        partition_ns,
+        ..WritePathProfile::default()
+    };
     let mut wal_range: Option<WalFrameRange> = None;
     if let Some(handle) = db.wal_handle().cloned() {
         let provisional_id = handle.next_provisional_id();
+        let append_submit_started = Instant::now();
         let mut append_tickets = Vec::new();
         if let Some(ref batch) = upsert_batch {
             let ticket = handle
@@ -467,19 +524,35 @@ where
                 .map_err(KeyExtractError::from)?;
             append_tickets.push(ticket);
         }
+        profile.wal_append_submit_ns = duration_ns_u64(append_submit_started.elapsed());
+
         let mut tracker = WalRangeAccumulator::default();
+        let wal_append_wait_started = Instant::now();
         for ticket in append_tickets {
             let ack = ticket.durable().await.map_err(KeyExtractError::from)?;
             tracker.observe_range(ack.first_seq, ack.last_seq);
         }
+        profile.wal_append_wait_ns = duration_ns_u64(wal_append_wait_started.elapsed());
+        profile.wal_append_ns = profile
+            .wal_append_submit_ns
+            .saturating_add(profile.wal_append_wait_ns);
+
+        let wal_commit_submit_started = Instant::now();
         let commit_ticket = handle
             .txn_commit(provisional_id, commit_ts)
             .await
             .map_err(KeyExtractError::from)?;
+        profile.wal_commit_submit_ns = duration_ns_u64(wal_commit_submit_started.elapsed());
+
+        let wal_commit_wait_started = Instant::now();
         let commit_ack = commit_ticket
             .durable()
             .await
             .map_err(KeyExtractError::from)?;
+        profile.wal_commit_wait_ns = duration_ns_u64(wal_commit_wait_started.elapsed());
+        profile.wal_commit_ns = profile
+            .wal_commit_submit_ns
+            .saturating_add(profile.wal_commit_wait_ns);
         tracker.observe_range(commit_ack.first_seq, commit_ack.last_seq);
         wal_range = tracker.into_range();
     }
@@ -492,6 +565,7 @@ where
         if let Some(range) = wal_range {
             db.record_mutable_wal_range(range);
         }
+        let mutable_insert_started = Instant::now();
         if let Some(batch) = upsert_batch
             && let Some(sealed) = db.mem.insert_batch(batch, commit_ts)?
         {
@@ -504,12 +578,20 @@ where
             let wal_range_take = db.take_mutable_wal_range();
             db.add_immutable(sealed, wal_range_take);
         }
+        profile.mutable_insert_ns = duration_ns_u64(mutable_insert_started.elapsed());
+        let seal_started = Instant::now();
         db.maybe_seal_after_insert()?;
-        db.maybe_run_minor_compaction()
-            .await
-            .map_err(compaction_as_key_extract_error)?;
+        profile.seal_ns = duration_ns_u64(seal_started.elapsed());
+        if run_minor_compaction {
+            let minor_compaction_started = Instant::now();
+            db.maybe_run_minor_compaction()
+                .await
+                .map_err(compaction_as_key_extract_error)?;
+            profile.minor_compaction_ns = duration_ns_u64(minor_compaction_started.elapsed());
+        }
     }
-    Ok(())
+    profile.total_ns = duration_ns_u64(total_started.elapsed());
+    Ok(profile)
 }
 
 fn compaction_as_key_extract_error(err: SsTableError) -> KeyExtractError {

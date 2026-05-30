@@ -444,6 +444,7 @@ pub struct DbBuilder<S = Unconfigured> {
     state: S,
     compaction_options: Option<CompactionOptions>,
     minor_compaction: Option<MinorCompactionOptions>,
+    seal_policy: Option<Arc<dyn crate::inmem::policy::SealPolicy + Send + Sync>>,
 }
 
 /// Error returned when building a [`DB`] through [`DbBuilder`].
@@ -531,6 +532,8 @@ pub struct S3Spec {
     pub checksum: Option<bool>,
     /// Optional flag indicating that the bucket is versioned.
     pub versioned: Option<bool>,
+    /// Optional flag enabling S3 Express One Zone directory-bucket mode.
+    pub s3_express: Option<bool>,
 }
 
 impl S3Spec {
@@ -551,6 +554,7 @@ impl S3Spec {
             sign_payload: None,
             checksum: None,
             versioned: None,
+            s3_express: None,
         }
     }
 }
@@ -711,6 +715,10 @@ fn build_s3_fs(
         builder = builder.endpoint(endpoint.clone());
     }
 
+    if let Some(s3_express) = spec.s3_express {
+        builder = builder.s3_express(s3_express);
+    }
+
     let credential = AwsCredential {
         key_id: spec.credentials.access_key.clone(),
         secret_key: spec.credentials.secret_key.clone(),
@@ -779,6 +787,7 @@ impl DbBuilder<Unconfigured> {
             state: Unconfigured,
             compaction_options: None,
             minor_compaction: Some(MinorCompactionOptions::default()),
+            seal_policy: None,
         }
     }
 
@@ -799,6 +808,7 @@ impl DbBuilder<Unconfigured> {
             state: StorageConfig::new(fs, root, DurabilityClass::Volatile),
             compaction_options: self.compaction_options,
             minor_compaction: self.minor_compaction,
+            seal_policy: self.seal_policy,
         })
     }
 
@@ -839,6 +849,7 @@ impl DbBuilder<Unconfigured> {
             state,
             compaction_options: self.compaction_options,
             minor_compaction: self.minor_compaction,
+            seal_policy: self.seal_policy,
         })
     }
 
@@ -856,6 +867,7 @@ impl DbBuilder<Unconfigured> {
             state: StorageConfig::new(fs, root, DurabilityClass::Durable),
             compaction_options: self.compaction_options,
             minor_compaction: self.minor_compaction,
+            seal_policy: self.seal_policy,
         })
     }
 
@@ -877,6 +889,7 @@ impl DbBuilder<Unconfigured> {
             state: StorageConfig::new(fs, root, DurabilityClass::Durable),
             compaction_options: self.compaction_options,
             minor_compaction: self.minor_compaction,
+            seal_policy: self.seal_policy,
         })
     }
 
@@ -973,6 +986,21 @@ where
         self
     }
 
+    /// Set the memtable sealing policy.
+    ///
+    /// The seal policy controls when the mutable memtable is frozen into an
+    /// immutable segment. For example, `BatchesThreshold { batches: 1 }` seals
+    /// after every ingested batch, which is useful for low-latency flush in
+    /// WASM or S3-backed deployments.
+    #[must_use]
+    pub fn with_seal_policy(
+        mut self,
+        policy: Arc<dyn crate::inmem::policy::SealPolicy + Send + Sync>,
+    ) -> Self {
+        self.seal_policy = Some(policy);
+        self
+    }
+
     #[allow(clippy::arc_with_non_send_sync)]
     fn build_minor_compaction_state(
         layout: &StorageLayout<FS>,
@@ -1065,6 +1093,7 @@ where
             state,
             compaction_options,
             minor_compaction,
+            seal_policy,
         } = self;
         let manifest_init = ManifestBootstrap::new(&layout);
         let file_ids = FileIdGenerator::default();
@@ -1134,6 +1163,7 @@ where
             commit_ack_mode,
             mem,
             layout.dyn_fs(),
+            layout.sst_route()?.path,
             manifest,
             manifest_table,
             table_meta,
@@ -1142,6 +1172,9 @@ where
         );
 
         inner.minor_compaction = minor_compaction_state;
+        if let Some(policy) = seal_policy {
+            inner.set_seal_policy(policy);
+        }
         if let Some(options) = compaction_options.as_ref() {
             inner.l0_backpressure = options.backpressure().cloned();
             inner.cas_backoff = options.cas_backoff_config().clone();
@@ -1307,8 +1340,8 @@ impl CompactionOptions {
 
     /// Attach compaction metrics to record per-job and scheduler counters.
     #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn compaction_metrics(mut self, metrics: Arc<CompactionMetrics>) -> Self {
+    #[doc(hidden)]
+    pub fn compaction_metrics(mut self, metrics: Arc<CompactionMetrics>) -> Self {
         self.compaction_metrics = Some(metrics);
         self
     }
@@ -1661,6 +1694,7 @@ where
             state,
             compaction_options,
             minor_compaction,
+            seal_policy,
         } = self;
         state.prepare().await?;
         let layout = state.layout()?;
@@ -1724,6 +1758,7 @@ where
                 mode_config,
                 Arc::clone(&executor),
                 fs_dyn,
+                layout.sst_route()?.path,
                 wal_cfg.clone(),
                 manifest,
                 manifest_table,
@@ -1732,6 +1767,9 @@ where
             .await
             .map_err(DbBuildError::Mode)?;
             inner.minor_compaction = minor_compaction_state;
+            if let Some(ref policy) = seal_policy {
+                inner.set_seal_policy(Arc::clone(policy));
+            }
             if let Some(options) = compaction_options.as_ref() {
                 inner.l0_backpressure = options.backpressure().cloned();
                 inner.cas_backoff = options.cas_backoff_config().clone();
@@ -1771,6 +1809,7 @@ where
                 state,
                 compaction_options,
                 minor_compaction,
+                seal_policy,
             }
             .build_with_layout(executor, layout)
             .await

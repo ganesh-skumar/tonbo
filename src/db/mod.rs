@@ -5,12 +5,12 @@
 //! engine while we focus on a single runtime representation.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use aisle::Pruner;
@@ -18,8 +18,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 use fusio::{
     DynFs,
-    executor::{Executor, Timer},
+    executor::{Executor, Instant as ExecInstant, Timer},
     mem::fs::InMemoryFs,
+    path::Path,
 };
 use futures::lock::Mutex as AsyncMutex;
 use lockable::LockableHashMap;
@@ -42,13 +43,21 @@ pub use error::DBError;
 pub use scan::{DEFAULT_SCAN_BATCH_ROWS, ScanBuilder, ScanSetupProfile};
 pub(crate) use wal::{TxnWalPublishContext, WalFrameRange};
 
+#[cfg(not(test))]
+use crate::observability::log_warn;
 pub use crate::{
-    compaction::planner::{CompactionStrategy, LeveledPlannerConfig},
+    compaction::{
+        metrics::{
+            CompactionMetrics, CompactionMetricsSnapshot, SstGcInspection, SstGcStatus,
+            SstSweepSummary,
+        },
+        planner::{CompactionStrategy, LeveledPlannerConfig},
+    },
     inmem::policy::{BatchesThreshold, NeverSeal, SealPolicy},
     mode::DynModeConfig,
     query::{Expr, ScalarValue},
     schema::SchemaBuilder,
-    transaction::{CommitAckMode, Transaction},
+    transaction::{CommitAckMode, Snapshot, SnapshotError, Transaction},
     wal::WalSyncPolicy,
 };
 use crate::{
@@ -58,15 +67,18 @@ use crate::{
     key::KeyOwned,
     manifest::{
         ManifestError, ManifestFs, SstEntry, TableId, TableMeta, TonboManifest, VersionEdit,
-        WalSegmentRef,
+        VersionState, WalSegmentRef,
     },
     mvcc::{CommitClock, ReadView, Timestamp},
     ondisk::{
         bloom::{BloomFilterCache, default_bloom_cache},
         metadata::{ParquetMetadataCache, default_parquet_metadata_cache},
-        sstable::{SsTable, SsTableBuilder, SsTableConfig, SsTableDescriptor, SsTableError},
+        sstable::{
+            SsTable, SsTableBuilder, SsTableConfig, SsTableDescriptor, SsTableError,
+            manifest_storage_path,
+        },
     },
-    transaction::{Snapshot as TxSnapshot, SnapshotError, TransactionDurability, TransactionError},
+    transaction::{Snapshot as TxSnapshot, TransactionDurability, TransactionError},
     wal::{
         WalConfig as RuntimeWalConfig, WalHandle, frame::INITIAL_FRAME_SEQ, manifest_ext,
         replay::Replayer, state::WalStateHandle,
@@ -92,6 +104,196 @@ pub struct Version {
     pub sst_bytes: u64,
     /// Number of compaction levels with data.
     pub level_count: usize,
+}
+
+/// Write-path timing breakdown for a single ingest operation.
+///
+/// Values are measured in nanoseconds and cover the major phases of
+/// `ingest_with_tombstones` after the caller has already constructed the input
+/// `RecordBatch`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WritePathProfile {
+    partition_ns: u64,
+    wal_append_submit_ns: u64,
+    wal_append_wait_ns: u64,
+    wal_append_ns: u64,
+    wal_commit_submit_ns: u64,
+    wal_commit_wait_ns: u64,
+    wal_commit_ns: u64,
+    mutable_insert_ns: u64,
+    seal_ns: u64,
+    minor_compaction_ns: u64,
+    total_ns: u64,
+}
+
+impl WritePathProfile {
+    /// Time spent partitioning the incoming batch into upsert/delete payloads.
+    pub fn partition_ns(&self) -> u64 {
+        self.partition_ns
+    }
+
+    /// Time spent submitting WAL append payloads to the writer.
+    pub fn wal_append_submit_ns(&self) -> u64 {
+        self.wal_append_submit_ns
+    }
+
+    /// Time spent waiting for WAL append payload durable acks.
+    pub fn wal_append_wait_ns(&self) -> u64 {
+        self.wal_append_wait_ns
+    }
+
+    /// Time spent appending write payloads to the WAL and waiting for durable acks.
+    pub fn wal_append_ns(&self) -> u64 {
+        self.wal_append_ns
+    }
+
+    /// Time spent submitting the WAL commit marker to the writer.
+    pub fn wal_commit_submit_ns(&self) -> u64 {
+        self.wal_commit_submit_ns
+    }
+
+    /// Time spent waiting for the WAL commit marker durable ack.
+    pub fn wal_commit_wait_ns(&self) -> u64 {
+        self.wal_commit_wait_ns
+    }
+
+    /// Time spent writing the WAL commit marker and waiting for durability.
+    pub fn wal_commit_ns(&self) -> u64 {
+        self.wal_commit_ns
+    }
+
+    /// Time spent applying upserts/deletes into the mutable memtable.
+    pub fn mutable_insert_ns(&self) -> u64 {
+        self.mutable_insert_ns
+    }
+
+    /// Time spent evaluating and executing post-insert sealing.
+    pub fn seal_ns(&self) -> u64 {
+        self.seal_ns
+    }
+
+    /// Time spent in opportunistic minor compaction triggered by the ingest.
+    pub fn minor_compaction_ns(&self) -> u64 {
+        self.minor_compaction_ns
+    }
+
+    /// End-to-end time for the profiled ingest operation.
+    pub fn total_ns(&self) -> u64 {
+        self.total_ns
+    }
+
+    /// Combine two write profiles using saturating addition per field.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            partition_ns: self.partition_ns.saturating_add(other.partition_ns),
+            wal_append_submit_ns: self
+                .wal_append_submit_ns
+                .saturating_add(other.wal_append_submit_ns),
+            wal_append_wait_ns: self
+                .wal_append_wait_ns
+                .saturating_add(other.wal_append_wait_ns),
+            wal_append_ns: self.wal_append_ns.saturating_add(other.wal_append_ns),
+            wal_commit_submit_ns: self
+                .wal_commit_submit_ns
+                .saturating_add(other.wal_commit_submit_ns),
+            wal_commit_wait_ns: self
+                .wal_commit_wait_ns
+                .saturating_add(other.wal_commit_wait_ns),
+            wal_commit_ns: self.wal_commit_ns.saturating_add(other.wal_commit_ns),
+            mutable_insert_ns: self
+                .mutable_insert_ns
+                .saturating_add(other.mutable_insert_ns),
+            seal_ns: self.seal_ns.saturating_add(other.seal_ns),
+            minor_compaction_ns: self
+                .minor_compaction_ns
+                .saturating_add(other.minor_compaction_ns),
+            total_ns: self.total_ns.saturating_add(other.total_ns),
+        }
+    }
+}
+
+fn version_from_state(state: VersionState) -> Version {
+    let sst_count = state.ssts.iter().map(|level| level.len()).sum();
+    let sst_bytes = state
+        .ssts
+        .iter()
+        .flatten()
+        .filter_map(|entry| entry.stats().map(|stats| stats.bytes))
+        .fold(0u64, |acc, bytes| {
+            acc.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+    Version {
+        timestamp: state.commit_timestamp,
+        sst_count,
+        sst_bytes,
+        level_count: state.ssts.iter().filter(|level| !level.is_empty()).count(),
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotPinRegistry {
+    pins: Mutex<BTreeMap<Timestamp, usize>>,
+}
+
+impl SnapshotPinRegistry {
+    fn pin(self: &Arc<Self>, manifest_ts: Timestamp) -> SnapshotPinGuard {
+        let mut guard = self
+            .pins
+            .lock()
+            .expect("snapshot pin registry mutex poisoned");
+        let count = guard.entry(manifest_ts).or_insert(0);
+        *count = count.saturating_add(1);
+        drop(guard);
+        SnapshotPinGuard {
+            inner: Arc::new(SnapshotPinGuardInner {
+                registry: Arc::clone(self),
+                manifest_ts,
+            }),
+        }
+    }
+
+    pub(crate) fn active_versions(&self) -> Vec<Timestamp> {
+        self.pins
+            .lock()
+            .expect("snapshot pin registry mutex poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn release(&self, manifest_ts: Timestamp) {
+        let mut guard = self
+            .pins
+            .lock()
+            .expect("snapshot pin registry mutex poisoned");
+        let Some(count) = guard.get_mut(&manifest_ts) else {
+            return;
+        };
+        if *count <= 1 {
+            guard.remove(&manifest_ts);
+        } else {
+            *count -= 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotPinGuard {
+    #[allow(dead_code)]
+    inner: Arc<SnapshotPinGuardInner>,
+}
+
+#[derive(Debug)]
+struct SnapshotPinGuardInner {
+    registry: Arc<SnapshotPinRegistry>,
+    manifest_ts: Timestamp,
+}
+
+impl Drop for SnapshotPinGuardInner {
+    fn drop(&mut self) {
+        self.registry.release(self.manifest_ts);
+    }
 }
 
 /// State bundle for opportunistic minor compaction.
@@ -134,12 +336,12 @@ struct L0Stats {
 
 struct L0StatsCache {
     stats: L0Stats,
-    last_refresh: Instant,
+    last_refresh: ExecInstant,
     valid: bool,
 }
 
 impl L0StatsCache {
-    fn new(now: Instant) -> Self {
+    fn new(now: ExecInstant) -> Self {
         Self {
             stats: L0Stats {
                 file_count: 0,
@@ -150,7 +352,7 @@ impl L0StatsCache {
         }
     }
 
-    fn is_fresh(&self, now: Instant, refresh_interval: Duration) -> bool {
+    fn is_fresh(&self, now: ExecInstant, refresh_interval: Duration) -> bool {
         self.valid && now.saturating_duration_since(self.last_refresh) < refresh_interval
     }
 
@@ -158,7 +360,7 @@ impl L0StatsCache {
         self.stats
     }
 
-    fn update(&mut self, now: Instant, stats: L0Stats) {
+    fn update(&mut self, now: ExecInstant, stats: L0Stats) {
         self.stats = stats;
         self.last_refresh = now;
         self.valid = true;
@@ -339,7 +541,19 @@ where
 
     /// Ingest a RecordBatch into the database (auto-commit mode).
     pub async fn ingest(&self, batch: RecordBatch) -> Result<(), DBError> {
-        self.inner.ingest(batch).await.map_err(DBError::Key)
+        #[cfg(test)]
+        {
+            self.inner.ingest(batch).await.map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            self.inner
+                .ingest_without_minor_compaction(batch)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(())
+        }
     }
 
     /// Ingest a batch along with its tombstone bitmap, routing through the WAL when enabled.
@@ -351,10 +565,47 @@ where
         batch: RecordBatch,
         tombstones: Vec<bool>,
     ) -> Result<(), DBError> {
-        self.inner
-            .ingest_with_tombstones(batch, tombstones)
-            .await
-            .map_err(DBError::Key)
+        #[cfg(test)]
+        {
+            self.inner
+                .ingest_with_tombstones(batch, tombstones)
+                .await
+                .map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            self.inner
+                .ingest_with_tombstones_without_minor_compaction(batch, tombstones)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(())
+        }
+    }
+
+    /// Ingest a batch and return a write-path timing breakdown.
+    pub async fn ingest_with_tombstones_with_profile(
+        &self,
+        batch: RecordBatch,
+        tombstones: Vec<bool>,
+    ) -> Result<WritePathProfile, DBError> {
+        #[cfg(test)]
+        {
+            self.inner
+                .ingest_with_tombstones_with_profile(batch, tombstones)
+                .await
+                .map_err(DBError::Key)
+        }
+        #[cfg(not(test))]
+        {
+            let profile = self
+                .inner
+                .ingest_with_tombstones_with_profile_without_minor_compaction(batch, tombstones)
+                .await
+                .map_err(DBError::Key)?;
+            DbInner::schedule_background_minor_compaction(Arc::clone(&self.inner));
+            Ok(profile)
+        }
     }
 
     /// Start building a scan query.
@@ -407,6 +658,36 @@ where
     /// ```
     pub async fn list_versions(&self, limit: usize) -> Result<Vec<Version>, ManifestError> {
         self.inner.list_versions(limit).await
+    }
+
+    /// Run one authorized SST sweep against the current manifest root set.
+    #[doc(hidden)]
+    pub async fn sweep_sst_objects(&self) -> Result<SstSweepSummary, DBError> {
+        self.inner
+            .sweep_manifest_ssts()
+            .await
+            .map_err(DBError::from)
+    }
+
+    /// Snapshot compaction metrics if this DB was configured to collect them.
+    #[doc(hidden)]
+    pub fn compaction_metrics_snapshot(&self) -> Option<CompactionMetricsSnapshot> {
+        self.inner.compaction_metrics_snapshot()
+    }
+
+    /// Inspect staged SST GC state for the current table.
+    #[doc(hidden)]
+    pub async fn sst_gc_status(&self) -> Result<Option<SstGcStatus>, DBError> {
+        self.inner.sst_gc_status().await.map_err(DBError::from)
+    }
+
+    /// Inspect the exact persisted SST GC plan for the current table.
+    #[doc(hidden)]
+    pub async fn inspect_sst_gc_plan(&self) -> Result<Option<SstGcInspection>, DBError> {
+        self.inner
+            .inspect_sst_gc_plan()
+            .await
+            .map_err(DBError::from)
     }
 }
 
@@ -470,6 +751,8 @@ where
     pub(crate) executor: Arc<E>,
     /// Unified filesystem access for SSTable reads, WAL, and other I/O operations.
     fs: Arc<dyn DynFs>,
+    /// Root directory prefix for SST objects referenced by manifest paths.
+    sst_root: Path,
     // Optional WAL handle when durability is enabled.
     wal: Option<WalHandle<E>>,
     /// Pending WAL configuration captured before the writer is installed.
@@ -488,6 +771,8 @@ where
     pruner_cache: Arc<E::Mutex<PrunerCache>>,
     /// Cached Parquet metadata for SST pruning.
     metadata_cache: Arc<E::Mutex<ParquetMetadataCache>>,
+    /// In-process manifest-version pins held by live snapshots.
+    snapshot_pins: Arc<SnapshotPinRegistry>,
     /// WAL frame bounds covering the current mutable memtable, if any.
     mutable_wal_range: Arc<Mutex<Option<WalFrameRange>>>,
     /// Per-key transactional locks (wired once transactional writes arrive).
@@ -500,6 +785,12 @@ where
     flush_lock: AsyncMutex<()>,
     /// Optional minor compaction hook.
     minor_compaction: Option<MinorCompactionState>,
+    #[cfg(not(test))]
+    /// Single-flight guard for background minor compaction spawned from foreground writes.
+    minor_compaction_pending: AtomicBool,
+    #[cfg(not(test))]
+    /// Sticky rerun flag set when writes arrive while a background minor compaction is active.
+    minor_compaction_rerun: AtomicBool,
     /// Optional L0 backpressure configuration for ingest and minor compaction.
     l0_backpressure: Option<L0BackpressureConfig>,
     l0_stats_cache: AsyncMutex<L0StatsCache>,
@@ -531,6 +822,8 @@ where
     pub(crate) executor: Arc<E>,
     /// Unified filesystem access for SSTable reads, WAL, and other I/O operations.
     fs: Arc<dyn DynFs>,
+    /// Root directory prefix for SST objects referenced by manifest paths.
+    sst_root: Path,
     // Optional WAL handle when durability is enabled.
     wal: Option<WalHandle<E>>,
     /// Pending WAL configuration captured before the writer is installed.
@@ -549,6 +842,8 @@ where
     pruner_cache: Arc<E::Mutex<PrunerCache>>,
     /// Cached Parquet metadata for SST pruning.
     metadata_cache: Arc<E::Mutex<ParquetMetadataCache>>,
+    /// In-process manifest-version pins held by live snapshots.
+    snapshot_pins: Arc<SnapshotPinRegistry>,
     /// WAL frame bounds covering the current mutable memtable, if any.
     mutable_wal_range: Arc<Mutex<Option<WalFrameRange>>>,
     /// Per-key transactional locks (wired once transactional writes arrive).
@@ -561,6 +856,12 @@ where
     flush_lock: AsyncMutex<()>,
     /// Optional minor compaction hook.
     minor_compaction: Option<MinorCompactionState>,
+    #[cfg(not(test))]
+    /// Single-flight guard for background minor compaction spawned from foreground writes.
+    minor_compaction_pending: AtomicBool,
+    #[cfg(not(test))]
+    /// Sticky rerun flag set when writes arrive while a background minor compaction is active.
+    minor_compaction_rerun: AtomicBool,
     /// Optional L0 backpressure configuration for ingest and minor compaction.
     l0_backpressure: Option<L0BackpressureConfig>,
     l0_stats_cache: AsyncMutex<L0StatsCache>,
@@ -608,6 +909,25 @@ where
         Arc::clone(&self.metadata_cache)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn active_snapshot_pins(&self) -> Vec<Timestamp> {
+        self.snapshot_pins.active_versions()
+    }
+
+    fn pin_snapshot_version(&self, manifest_ts: Timestamp) -> SnapshotPinGuard {
+        self.snapshot_pins.pin(manifest_ts)
+    }
+
+    fn snapshot_pin_for_manifest(
+        &self,
+        manifest_snapshot: &crate::manifest::TableSnapshot,
+    ) -> Option<SnapshotPinGuard> {
+        manifest_snapshot
+            .latest_version
+            .as_ref()
+            .map(|version| self.pin_snapshot_version(version.commit_timestamp()))
+    }
+
     /// Acquire a read guard to the mutable memtable (for testing/inspection).
     #[cfg(all(test, feature = "tokio"))]
     pub(crate) fn mem_read(&self) -> crate::inmem::mutable::memtable::TestMemRef<'_> {
@@ -640,6 +960,7 @@ where
         commit_ack_mode: CommitAckMode,
         mem: DynMem,
         fs: Arc<dyn DynFs>,
+        sst_root: Path,
         manifest: TonboManifest<FS, E>,
         manifest_table: TableId,
         table_meta: TableMeta,
@@ -656,6 +977,7 @@ where
             policy: crate::inmem::policy::default_policy(),
             executor,
             fs,
+            sst_root,
             wal: None,
             wal_config,
             table_meta,
@@ -665,12 +987,17 @@ where
             bloom_cache: default_bloom_cache::<E>(),
             pruner_cache: Arc::new(E::mutex(HashMap::new())),
             metadata_cache: default_parquet_metadata_cache::<E>(),
+            snapshot_pins: Arc::new(SnapshotPinRegistry::default()),
             mutable_wal_range: Arc::new(Mutex::new(None)),
             _key_locks: Arc::new(LockableHashMap::new()),
             compaction_worker: None,
             compaction_metrics: None,
             flush_lock: AsyncMutex::new(()),
             minor_compaction: None,
+            #[cfg(not(test))]
+            minor_compaction_pending: AtomicBool::new(false),
+            #[cfg(not(test))]
+            minor_compaction_rerun: AtomicBool::new(false),
             l0_backpressure: None,
             l0_stats_cache: AsyncMutex::new(L0StatsCache::new(now)),
             l0_stats_refreshing: AtomicBool::new(false),
@@ -683,6 +1010,7 @@ where
         config: DynModeConfig,
         executor: Arc<E>,
         fs: Arc<dyn DynFs>,
+        sst_root: Path,
         wal_cfg: RuntimeWalConfig,
         manifest: TonboManifest<FS, E>,
         manifest_table: TableId,
@@ -692,6 +1020,7 @@ where
             config,
             executor,
             fs,
+            sst_root,
             wal_cfg,
             manifest,
             manifest_table,
@@ -705,6 +1034,7 @@ where
         config: DynModeConfig,
         executor: Arc<E>,
         fs: Arc<dyn DynFs>,
+        sst_root: Path,
         wal_cfg: RuntimeWalConfig,
         manifest: TonboManifest<FS, E>,
         manifest_table: TableId,
@@ -725,6 +1055,7 @@ where
             commit_ack_mode,
             mem,
             fs,
+            sst_root,
             manifest,
             manifest_table,
             table_meta,
@@ -763,7 +1094,24 @@ where
     }
 
     /// Unified ingestion entry point for dynamic batches.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn ingest(&self, batch: RecordBatch) -> Result<(), KeyExtractError> {
+        self.ingest_impl(batch, true).await
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn ingest_without_minor_compaction(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<(), KeyExtractError> {
+        self.ingest_impl(batch, false).await
+    }
+
+    async fn ingest_impl(
+        &self,
+        batch: RecordBatch,
+        run_minor_compaction: bool,
+    ) -> Result<(), KeyExtractError> {
         if self.schema.as_ref() != batch.schema().as_ref() {
             return Err(KeyExtractError::SchemaMismatch {
                 expected: self.schema.clone(),
@@ -799,11 +1147,13 @@ where
         }
         self.insert_into_mutable(batch, commit_ts)?;
         self.maybe_seal_after_insert()?;
-        self.maybe_run_minor_compaction().await.map_err(|err| {
-            KeyExtractError::Arrow(ArrowError::ComputeError(format!(
-                "minor compaction failed: {err}"
-            )))
-        })?;
+        if run_minor_compaction {
+            self.maybe_run_minor_compaction().await.map_err(|err| {
+                KeyExtractError::Arrow(ArrowError::ComputeError(format!(
+                    "minor compaction failed: {err}"
+                )))
+            })?;
+        }
         Ok(())
     }
 
@@ -824,12 +1174,14 @@ where
             .manifest
             .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
             .await?;
+        let manifest_pin = self.snapshot_pin_for_manifest(&manifest_snapshot);
         let next_ts = self.commit_clock.peek();
         let read_ts = next_ts.saturating_sub(1);
         let read_view = ReadView::new(read_ts);
         Ok(TxSnapshot::from_table_snapshot(
             read_view,
             manifest_snapshot,
+            manifest_pin,
         ))
     }
 
@@ -864,22 +1216,49 @@ where
         // Find the version at or before the requested timestamp (versions are newest-first)
         let target_version = versions.iter().find(|v| v.commit_timestamp <= timestamp);
 
-        let manifest_snapshot = if let Some(version) = target_version {
-            // Load the historical version from manifest
-            self.manifest
+        let (manifest_snapshot, manifest_pin) = if let Some(version) = target_version {
+            // Pin the target manifest timestamp before loading its snapshot, so SST GC sees the
+            // version as protected during the in-flight load.
+            let manifest_pin = Some(self.pin_snapshot_version(version.commit_timestamp));
+            let manifest_snapshot = self
+                .manifest
                 .snapshot_at_version(self.manifest_table, version.commit_timestamp)
-                .await?
-        } else {
-            // No version at or before the timestamp - use latest with MVCC filtering
-            self.manifest
+                .await?;
+            debug_assert_eq!(
+                manifest_snapshot
+                    .latest_version
+                    .as_ref()
+                    .map(|snapshot_version| snapshot_version.commit_timestamp()),
+                Some(version.commit_timestamp)
+            );
+            (manifest_snapshot, manifest_pin)
+        } else if versions.is_empty() {
+            // No committed manifest versions exist yet, so only the current in-memory/head view can
+            // answer the request.
+            let manifest_snapshot = self
+                .manifest
                 .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
-                .await?
+                .await?;
+            let manifest_pin = self.snapshot_pin_for_manifest(&manifest_snapshot);
+            (manifest_snapshot, manifest_pin)
+        } else {
+            return Err(ManifestError::VersionUnavailable {
+                requested: timestamp,
+                oldest_available: versions
+                    .last()
+                    .map(|version| version.commit_timestamp)
+                    .ok_or(ManifestError::Invariant(
+                        "committed manifest versions unexpectedly missing",
+                    ))?,
+            }
+            .into());
         };
 
         let read_view = ReadView::new(timestamp);
         Ok(TxSnapshot::from_table_snapshot(
             read_view,
             manifest_snapshot,
+            manifest_pin,
         ))
     }
 
@@ -900,31 +1279,21 @@ where
     /// }
     /// ```
     pub async fn list_versions(&self, limit: usize) -> Result<Vec<Version>, ManifestError> {
-        let states = self
+        let mut states = self
             .manifest
             .list_versions(self.manifest_table, limit)
             .await?;
+        if states.is_empty() {
+            let snapshot = self
+                .manifest
+                .snapshot_latest_with_fallback(self.manifest_table, &self.table_meta)
+                .await?;
+            if let Some(latest) = snapshot.latest_version {
+                states.push(latest);
+            }
+        }
 
-        Ok(states
-            .into_iter()
-            .map(|s| {
-                let sst_count = s.ssts.iter().map(|level| level.len()).sum();
-                let sst_bytes = s
-                    .ssts
-                    .iter()
-                    .flatten()
-                    .filter_map(|entry| entry.stats().map(|stats| stats.bytes))
-                    .fold(0u64, |acc, bytes| {
-                        acc.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
-                    });
-                Version {
-                    timestamp: s.commit_timestamp,
-                    sst_count,
-                    sst_bytes,
-                    level_count: s.ssts.iter().filter(|level| !level.is_empty()).count(),
-                }
-            })
-            .collect())
+        Ok(states.into_iter().map(version_from_state).collect())
     }
 
     /// Allocate the next commit timestamp for WAL/autocommit flows.
@@ -1091,6 +1460,48 @@ where
         }
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn schedule_background_minor_compaction(db: Arc<Self>)
+    where
+        E: 'static,
+    {
+        if db.minor_compaction.is_none() {
+            return;
+        }
+        if db
+            .minor_compaction_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            db.minor_compaction_rerun.store(true, Ordering::Release);
+            return;
+        }
+
+        let runtime = Arc::clone(&db.executor);
+        let db_for_task = Arc::clone(&db);
+        runtime.spawn(async move {
+            let result = db_for_task.maybe_run_minor_compaction().await;
+            let rerun = db_for_task
+                .minor_compaction_rerun
+                .swap(false, Ordering::AcqRel);
+            db_for_task
+                .minor_compaction_pending
+                .store(false, Ordering::Release);
+
+            if let Err(err) = result {
+                log_warn!(
+                    component = "compaction",
+                    event = "minor_compaction_background_failed",
+                    error = ?err,
+                );
+            }
+
+            if rerun {
+                Self::schedule_background_minor_compaction(db_for_task);
+            }
+        });
+    }
+
     /// Plan and flush immutable segments into a Parquet-backed SSTable.
     pub(crate) async fn flush_immutables_with_descriptor(
         &self,
@@ -1149,7 +1560,11 @@ where
                         "sst descriptor missing data path",
                     ))
                 })?;
-                let delete_path = descriptor_ref.delete_path().cloned();
+                let data_path = manifest_storage_path(&self.sst_root, &data_path);
+                let delete_path = descriptor_ref
+                    .delete_path()
+                    .cloned()
+                    .map(|path| manifest_storage_path(&self.sst_root, &path));
                 let stats = descriptor_ref.stats().cloned();
                 let sst_entry = SstEntry::new(
                     descriptor_ref.id().clone(),
@@ -1213,8 +1628,7 @@ where
     }
 
     /// Set or replace the sealing policy used by this DB.
-    #[cfg(test)]
-    pub fn set_seal_policy(&mut self, policy: Arc<dyn SealPolicy + Send + Sync>) {
+    pub(crate) fn set_seal_policy(&mut self, policy: Arc<dyn SealPolicy + Send + Sync>) {
         self.policy = policy;
     }
 
@@ -1257,6 +1671,7 @@ where
             commit_ack_mode,
             mem,
             fs,
+            Path::default(),
             manifest,
             manifest_table,
             table_meta,
